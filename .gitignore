@@ -1,0 +1,17 @@
+# Data and runs (per contract and CLAUDE.md)
+runs/
+features/
+*.npz
+*.npy
+
+# Python cache and testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environment / IDE
+.venv/
+venv/
+.idea/
+.vscode/
