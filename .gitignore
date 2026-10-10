@@ -1,6 +1,10 @@
 # Data and runs (per contract and CLAUDE.md)
 runs/
 features/
+features_synthetic/
+runs_synthetic/
+results/
+handoff/
 *.npz
 *.npy
 
@@ -15,3 +19,4 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+.DS_Store
