@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 .DS_Store
+results/
+features_synthetic/
+runs_synthetic/
+handoff/
