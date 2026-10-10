@@ -1,0 +1,10 @@
+{
+  "backbone": "torchvision efficientnet_b0",
+  "weights": "IMAGENET1K_V1",
+  "feat_dim": 1280,
+  "preprocess": "Resize(224)+CenterCrop(224)+ImageNet normalize, no augmentation",
+  "dataset": "flwrlabs/fed-isic2019",
+  "dataset_revision": "d1457caea44f57dfe855bcf67e2ec09bb06781e9",
+  "torch": "2.7.1+cu118",
+  "torchvision": "0.22.1+cu118"
+}
