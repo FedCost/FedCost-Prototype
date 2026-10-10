@@ -10,7 +10,8 @@ from contract import (N_CLIENTS, N_CLASSES, FEAT_DIM, load_features,
 def predict(W, X):
     return (X @ W[:-1] + W[-1]).argmax(1)
 
-def local_train(W, X, y, epochs=1, lr=0.05, bs=64, rng=None):
+# Defaults match reference/coalition_meta.json (Shapley coalitions); change both together.
+def local_train(W, X, y, epochs=2, lr=0.05, bs=128, l2=1e-4, rng=None):
     W = W.copy()
     Y = np.eye(N_CLASSES)[y]
     for _ in range(epochs):
@@ -21,7 +22,7 @@ def local_train(W, X, y, epochs=1, lr=0.05, bs=64, rng=None):
             z -= z.max(1, keepdims=True)
             P = np.exp(z); P /= P.sum(1, keepdims=True)
             G = (P - Y[b]) / len(b)
-            W[:-1] -= lr * X[b].T @ G
+            W[:-1] -= lr * (X[b].T @ G + l2 * W[:-1])   # L2 on weights only, not the bias
             W[-1] -= lr * G.sum(0)
     return W
 
