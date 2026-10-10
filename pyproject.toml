@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fedcost"
+version = "0.1.0"
+description = "FedCost federation engine: Flower wrapper"
+requires-python = ">=3.11"
+dependencies = ["flwr[simulation]==1.39.0", "numpy"]
+
+[tool.hatch.build.targets.wheel]
+include = ["fedcost_flwr", "engine.py", "contract.py"]
+
+[tool.flwr.app]
+publisher = "fedcost"
+
+[tool.flwr.app.components]
+serverapp = "fedcost_flwr.server_app:app"
+clientapp = "fedcost_flwr.client_app:app"
+
+[tool.flwr.app.config]
+agg = "fedavg"
+rounds = 15
+seed = 0
+attack = -1
+project-dir = ""
+
+
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
+
+# [tool.flwr.federations]
+# default = "local-simulation"
+
+# [tool.flwr.federations.local-simulation]
+# options.num-supernodes = 6
