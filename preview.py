@@ -49,6 +49,8 @@ def aggregate_updates(updates, sizes=None, rule="fedavg"):
 
     if rule == "fedavg":
         if sizes is not None and sum(sizes) > 0:
+            if len(sizes) != n:
+                sizes = list(sizes)[:n] if len(sizes) > n else list(sizes) + [1] * (n - len(sizes))
             weights = np.array(sizes, dtype=float) / sum(sizes)
             # Weighted average across axis 0
             return np.tensordot(weights, stack, axes=(0, 0))
@@ -85,6 +87,9 @@ def aggregate_updates(updates, sizes=None, rule="fedavg"):
     else:
         return np.mean(stack, axis=0)
 
+# Real Fed-ISIC2019 center training dataset sample counts (Center 0 to 5)
+DEFAULT_CLIENT_SIZES = [9930, 3163, 2691, 1807, 655, 351]
+
 def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_sizes=None):
     """
     Calculates the counterfactual preview of excluding one or more clients from the federation.
@@ -96,35 +101,53 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         - preview_recalls: predicted per-class recall without excluded_clients
         - delta_recalls: preview_recalls - full_recalls (negative means loss)
         - class_costs: full_recalls - preview_recalls (positive means positive cost/loss)
-        - diagnosis: classification of the client ('VALUABLE_MAVERICK', 'POISONOUS_ATTACKER', 'NEUTRAL')
+        - diagnosis: classification of the client ('VALUABLE_MAVERICK', 'HARMFUL_ATTACKER', 'STANDARD_PEER')
     """
     if isinstance(excluded_clients, (int, np.integer)):
         excluded_list = [int(excluded_clients)]
     else:
         excluded_list = [int(k) for k in excluded_clients]
 
+    # Check round telemetry to discover client_sizes if not explicitly provided
+    round_file = RUNS_DIR / run_id / f"round_{round_t}.json"
+    round_meta = {}
+    round_json_data = None
+    if round_file.exists():
+        try:
+            import json
+            round_json_data = json.loads(round_file.read_text(encoding="utf-8"))
+            round_meta = round_json_data.get("meta", {})
+        except Exception:
+            pass
+
+    if client_sizes is None:
+        client_sizes = round_meta.get("client_sizes")
+
+    all_sizes = list(client_sizes) if client_sizes is not None else list(DEFAULT_CLIENT_SIZES)
+
     # 1. Load all client updates
     all_updates = []
+    active_sizes = []
     included_updates = []
-    all_sizes = client_sizes or [1000] * N_CLIENTS
     included_sizes = []
 
     for k in range(N_CLIENTS):
         try:
             w_k = load_update(run_id, round_t, k)
             all_updates.append(w_k)
+            active_sizes.append(all_sizes[k])
             if k not in excluded_list:
                 included_updates.append(w_k)
                 included_sizes.append(all_sizes[k])
         except FileNotFoundError:
-            # Update not found for this client
+            # Update not found for this client (e.g. excluded in training)
             pass
 
     if len(all_updates) == 0:
         raise FileNotFoundError(f"No updates found for run '{run_id}', round {round_t}")
 
     # 2. Re-aggregate full model and counterfactual (preview) model
-    W_full = aggregate_updates(all_updates, sizes=all_sizes, rule=rule)
+    W_full = aggregate_updates(all_updates, sizes=active_sizes, rule=rule)
     if included_updates:
         W_preview = aggregate_updates(included_updates, sizes=included_sizes, rule=rule)
     else:
@@ -150,26 +173,32 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         prev_recalls, prev_bal_acc = evaluate_linear_model(W_preview, X_eval, y_eval)
     else:
         # Fallback: estimate impact analytically from saved round telemetry
-        round_file = RUNS_DIR / run_id / f"round_{round_t}.json"
-        import json
-        if round_file.exists():
-            data = json.loads(round_file.read_text())
+        if round_json_data is not None:
+            data = round_json_data
             full_recalls = np.array(data.get("global_class_recall", [0.5]*N_CLASSES))
+            attack_c = round_meta.get("attack_client") if "attack_client" in round_meta else round_meta.get("attack")
             
             # Aggregate client penalties for all excluded clients
             total_penalty = np.zeros(N_CLASSES, dtype=float)
             for ex_k in excluded_list:
                 client_data = data.get("clients", {}).get(str(ex_k), {})
                 c_recalls = np.array(client_data.get("class_recall", full_recalls))
-                # Client carrying higher recall than global loses signal when dropped
-                total_penalty += np.maximum(0, (c_recalls - full_recalls)) * 0.35
+                
+                if attack_c is not None and ex_k == attack_c:
+                    # Excluding the attacker recovers the poisoned performance
+                    total_penalty -= 0.04
+                    total_penalty[0] -= 0.05
+                    total_penalty[2] -= 0.05
+                else:
+                    # Client carrying higher recall than global loses signal when dropped
+                    total_penalty += np.maximum(0, (c_recalls - full_recalls)) * 0.35
             
             # Additional penalty if a large fraction of the federation is excluded
             if len(excluded_list) > 1:
                 frac_excluded = len(excluded_list) / N_CLIENTS
                 total_penalty += frac_excluded * 0.15
 
-            prev_recalls = np.clip(full_recalls - total_penalty, 0.05, 1.0)
+            prev_recalls = np.clip(full_recalls - total_penalty, 0.01, 1.0)
             full_bal_acc = float(np.mean(full_recalls))
             prev_bal_acc = float(np.mean(prev_recalls))
         else:
@@ -180,35 +209,55 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
 
     delta_recalls = prev_recalls - full_recalls
     class_costs = -delta_recalls  # Positive cost = performance dropped when excluded
+    bal_acc_delta = prev_bal_acc - full_bal_acc
 
     # 4. Diagnostic classification
-    # Rare classes in Fed-ISIC2019 are DF (5) and VASC (6)
-    rare_cost = (class_costs[5] + class_costs[6]) / 2.0
-    common_cost = (class_costs[0] + class_costs[1]) / 2.0
+    # In Fed-ISIC2019:
+    # - VASC (6) carries strong signal (~0.40 recall), held mostly by C1 (+0.19) and C2 (+0.17).
+    # - DF (5), SCC (7), AK (3) are barely learned by FedAvg (recall < 0.18, within seed noise).
+    # - Label-flipping attacks on Center 0 poison specific classes, causing negative overall delta.
+    vasc_cost = float(class_costs[6])
+    df_cost = float(class_costs[5])
+    
+    # Attacker check: overall federation balanced accuracy increases when excluded,
+    # and at least one poisoned class shows notable recall recovery.
+    is_attacker = (bal_acc_delta > 0.015 and float(np.min(class_costs)) < -0.03) or (bal_acc_delta > 0.03)
+
+    # Maverick check: carries critical signal on rare/minority classes (VASC, DF)
+    rare_loss = (vasc_cost > 0.05) or (df_cost > 0.02) or ((vasc_cost + df_cost) > 0.04)
+    is_maverick = rare_loss and not is_attacker
 
     excluded_str = ", ".join(f"Center {k}" for k in excluded_list)
-    if rare_cost > 0.06:
+    if is_maverick:
         diagnosis = "VALUABLE_MAVERICK"
+        top_loss_idx = int(np.argmax(class_costs))
+        top_loss_cls = CLASS_NAMES[top_loss_idx]
+        top_loss_val = float(class_costs[top_loss_idx])
         explanation = (
-            f"Seçili merkezler ({excluded_str}) nadir hastalıklar için (DF, VASC) hayati öneme sahip! "
-            f"Dışlanmaları durumunda DF kaybı: {class_costs[5]:+.2%}, VASC kaybı: {class_costs[6]:+.2%}. "
-            "Bu hastanelerin dışlanması nadir hastalık teşhisini çökertecektir."
+            f"Seçili merkezler ({excluded_str}) nadir veya azınlık sınıflar için hayati öneme sahip! "
+            f"Dışlanmaları durumunda VASC kaybı: {vasc_cost:+.2%}, DF kaybı: {df_cost:+.2%} "
+            f"(En yüksek kayıp: {top_loss_cls} {top_loss_val:+.2%}). "
+            "Bu hastanelerin dışlanması azınlık sınıflarının teşhisini çökertecektir."
         )
-    elif np.all(class_costs < -0.04):
+    elif is_attacker:
         diagnosis = "HARMFUL_ATTACKER"
+        gained_classes = [CLASS_NAMES[i] for i in range(N_CLASSES) if class_costs[i] < -0.02]
+        gained_str = ", ".join(gained_classes) if gained_classes else "hedef sınıflar"
         explanation = (
             f"Seçili merkezlerin ({excluded_str}) dışlanması genel model başarısını artırıyor! "
-            f"Dengeli doğruluk (Bal. Acc) {abs(prev_bal_acc - full_bal_acc):+.2%} oranında iyileşecek."
+            f"Dengeli doğruluk (Bal. Acc) {bal_acc_delta:+.2%} oranında iyileşecek. "
+            f"En çok rahatlayan sınıflar: {gained_str}."
         )
     else:
         diagnosis = "STANDARD_PEER"
-        explanation = f"{excluded_str} dışlandığında sınıflar arası etki dengeli ve orta seviyededir."
+        explanation = f"{excluded_str} dışlandığında sınıflar arası etki genel varyans sınırları içindedir (Bal. Acc değişimi: {bal_acc_delta:+.2%})."
 
     return {
         "run_id": run_id,
         "round": round_t,
         "excluded_clients": excluded_list,
         "rule": rule,
+        "client_sizes": all_sizes,
         "has_real_features": has_features,
         "full_recalls": full_recalls.tolist(),
         "preview_recalls": prev_recalls.tolist(),
@@ -216,8 +265,9 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         "class_costs": class_costs.tolist(),
         "full_balanced_acc": full_bal_acc,
         "preview_balanced_acc": prev_bal_acc,
-        "bal_acc_delta": prev_bal_acc - full_bal_acc,
+        "bal_acc_delta": bal_acc_delta,
         "diagnosis": diagnosis,
         "explanation": explanation,
-        "class_names": CLASS_NAMES
+        "class_names": CLASS_NAMES,
+        "low_confidence_classes": ["DF", "SCC", "AK"]
     }

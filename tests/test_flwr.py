@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+flwr = pytest.importorskip("flwr")
 from flwr.app import ArrayRecord, ConfigRecord, Context, Message, RecordDict
 from flwr.supercore.task_identity import TaskIdentity
 

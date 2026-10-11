@@ -170,7 +170,9 @@ def generate_run(run_id, aggregation="trimmed", attack_client=None, num_rounds=1
             "attack_client": attack_client,
             "excluded_clients": list(excluded_set),
             "round": t,
-            "balanced_accuracy": round(float(np.mean(global_recall)), 4)
+            "balanced_accuracy": round(float(np.mean(global_recall)), 4),
+            "client_sizes": [9930, 3163, 2691, 1807, 655, 351],
+            "is_synthetic": True
         }
         
         save_round(run_id, t, clients_data, global_recall, meta=meta)

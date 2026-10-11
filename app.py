@@ -51,6 +51,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+def is_synthetic_run(run_name):
+    """Determine whether a run was produced by fake/synthetic simulation."""
+    if run_name.startswith(("demo_", "sim_", "test_")):
+        return True
+    rd_path = RUNS_DIR / run_name / "round_0.json"
+    if rd_path.exists():
+        try:
+            m = json.loads(rd_path.read_text(encoding="utf-8")).get("meta", {})
+            if m.get("is_synthetic"):
+                return True
+        except Exception:
+            pass
+    return False
+
+def format_run_label(run_name):
+    return f"🧪 [Sentetik] {run_name}" if is_synthetic_run(run_name) else f"🟢 [Gerçek Motor] {run_name}"
+
 def get_available_runs():
     if not RUNS_DIR.exists():
         return []
@@ -83,13 +100,35 @@ with st.sidebar:
             st.rerun()
         st.stop()
 
-    default_idx = 0
-    if "active_run" in st.session_state and st.session_state["active_run"] in available_runs:
-        default_idx = available_runs.index(st.session_state["active_run"])
-    elif len(available_runs) > 1:
-        default_idx = 1
+    real_runs = [r for r in available_runs if not is_synthetic_run(r)]
+    run_filter = st.radio(
+        "Koşu Türü Filtresi:",
+        ["Tümü", "🟢 Gerçek Motor", "🧪 Sentetik"],
+        horizontal=True
+    )
+    if run_filter == "🟢 Gerçek Motor":
+        filtered_runs = [r for r in available_runs if not is_synthetic_run(r)]
+    elif run_filter == "🧪 Sentetik":
+        filtered_runs = [r for r in available_runs if is_synthetic_run(r)]
+    else:
+        filtered_runs = available_runs
 
-    selected_run = st.selectbox("Aktif Federasyon Koşumu:", available_runs, index=default_idx)
+    if not filtered_runs:
+        st.info("Bu filtreye uygun koşu bulunamadı.")
+        filtered_runs = available_runs
+
+    default_idx = 0
+    if "active_run" in st.session_state and st.session_state["active_run"] in filtered_runs:
+        default_idx = filtered_runs.index(st.session_state["active_run"])
+    elif run_filter == "Tümü" and real_runs and real_runs[0] in filtered_runs:
+        default_idx = filtered_runs.index(real_runs[0])
+
+    selected_run = st.selectbox(
+        "Aktif Federasyon Koşumu:",
+        filtered_runs,
+        index=default_idx,
+        format_func=format_run_label
+    )
     st.session_state["active_run"] = selected_run
     rounds_data = load_run_rounds(selected_run)
     
@@ -101,19 +140,32 @@ with st.sidebar:
     selected_round = st.slider("İncelenen Tur (Round):", min_value=0, max_value=total_rounds - 1, value=total_rounds - 1)
 
     cur_meta = rounds_data[selected_round].get("meta", {})
+    cur_agg = cur_meta.get("aggregation") or cur_meta.get("agg", "Bilinmiyor")
+    cur_attack = cur_meta.get("attack_client") if "attack_client" in cur_meta else cur_meta.get("attack")
+    cur_sizes = cur_meta.get("client_sizes", [9930, 3163, 2691, 1807, 655, 351])
+    attack_label = f"Merkez {cur_attack} (Etiket Çevirme)" if cur_attack is not None and cur_attack >= 0 else "Saldırı Yok (Temiz)"
+
     st.info(f"""
-    **Savunma:** `{cur_meta.get('aggregation', 'Bilinmiyor').upper()}`  
-    **Saldırı Durumu:** `{'Merkez ' + str(cur_meta.get('attack_client')) if cur_meta.get('attack_client') is not None else 'Saldırı Yok (Temiz)'}`  
+    **Savunma:** `{str(cur_agg).upper()}`  
+    **Saldırı Durumu:** `{attack_label}`  
+    **Tür:** `{'🧪 Sentetik Simülasyon' if is_synthetic_run(selected_run) else '🟢 Gerçek Motor Koşumu'}`  
     **Toplam Tur Sayısı:** `{total_rounds}`
     """)
 
     st.divider()
-    with st.expander("🧪 Yeni Koşum Simüle Et (LOO / Özel Koalisyon)", expanded=False):
-        st.caption("İstediğiniz hastaneleri dışarıda bırakıp 15 turluk yeni bir federasyon simülasyonu başlatın.")
+    with st.expander("🚀 Yeni Koşum Başlat (Gerçek Motor veya Simülasyon)", expanded=False):
+        st.caption("Farklı savunma kuralları, saldırı senaryoları ve hastane koalisyonlarıyla yeni bir koşum üretin.")
+        
+        run_mode = st.radio(
+            "Çalıştırma Yöntemi:",
+            ["🟢 Gerçek Motor (engine.py)", "🧪 Hızlı Sentetik Simülasyon"],
+            index=0
+        )
+
         inc_centers = st.multiselect(
             "Dahil Edilecek Hastaneler:",
             range(N_CLIENTS),
-            default=[0, 1, 3, 4, 5],  # Center 2 excluded by default as an example
+            default=list(range(N_CLIENTS)),
             format_func=lambda x: f"Center {x} {'(Nadir DF/VASC)' if x == 2 else '(Cihaz Farkı)' if x == 4 else ''}"
         )
         exc_centers = [c for c in range(N_CLIENTS) if c not in inc_centers]
@@ -121,29 +173,64 @@ with st.sidebar:
             st.warning(f"Dışlanan Hastaneler: {', '.join(f'Center {c}' for c in exc_centers)}")
         else:
             st.success("Tüm hastaneler dahil (Tam Koalisyon).")
-            
+        
         sim_agg = st.selectbox("Savunma Kuralı:", ["fedavg", "trimmed", "krum"], index=0)
         sim_attack = st.selectbox("Saldırı Senaryosu:", ["Yok", "Center 0 (Etiket Çevirme)"], index=0)
-        
-        default_name = f"sim_no_c{'_c'.join(map(str, exc_centers))}_{sim_agg}" if exc_centers else f"sim_all_{sim_agg}"
-        custom_run_id = st.text_input("Koşum Adı:", value=default_name)
-        
-        if st.button("🚀 Simülasyonu Koş ve Kaydet", use_container_width=True):
-            with st.spinner("15 turluk federasyon simüle ediliyor..."):
-                import importlib
-                import fake_run_generator
-                importlib.reload(fake_run_generator)
-                fake_run_generator.generate_run(
-                    run_id=custom_run_id,
-                    aggregation=sim_agg,
-                    attack_client=0 if "Center 0" in sim_attack else None,
-                    num_rounds=15,
-                    seed=42,
-                    excluded_clients=exc_centers
-                )
-                st.session_state["active_run"] = custom_run_id
-                st.success(f"'{custom_run_id}' başarıyla oluşturuldu!")
-                st.rerun()
+        atk_id = 0 if "Center 0" in sim_attack else None
+
+        exc_suffix = f"_no_c{'_c'.join(map(str, exc_centers))}" if exc_centers else ""
+
+        if run_mode == "🟢 Gerçek Motor (engine.py)":
+            st.info("💡 **Gerçek Motor:** Umut'un EfficientNet öznitelikleri üzerinde çalışan saf NumPy federasyon motorunu (SGD, yerel epochlar, gerçek gradyanlar) çalıştırır.")
+            sim_rounds = st.slider("Tur Sayısı:", min_value=5, max_value=30, value=15, step=5)
+            default_name = f"engine_{sim_agg}{exc_suffix}_atk{atk_id if atk_id is not None else 'None'}"
+            custom_run_id = st.text_input("Koşum Adı:", value=default_name)
+            
+            if st.button("🚀 Gerçek Motoru Çalıştır", use_container_width=True):
+                with st.spinner(f"Gerçek federasyon motoru {sim_rounds} tur eğitiliyor..."):
+                    from pathlib import Path
+                    import contract
+                    # Ensure features exist
+                    feats_dir = contract.FEATURES_DIR
+                    if not (feats_dir.exists() and (feats_dir / "center_0_train.npz").exists()):
+                        import synthetic
+                        synthetic.make()
+                    
+                    import importlib
+                    import engine
+                    importlib.reload(engine)
+                    engine.run(
+                        agg=sim_agg,
+                        rounds=sim_rounds,
+                        attack=atk_id,
+                        seed=42,
+                        run_id=custom_run_id,
+                        excluded_clients=exc_centers
+                    )
+                    st.session_state["active_run"] = custom_run_id
+                    st.success(f"'{custom_run_id}' gerçek motor ile eğitildi ve kaydedildi!")
+                    st.rerun()
+        else:
+            st.caption("Sentetik dağılımlar üzerinden anlık simülasyon üretir.")
+            default_name = f"sim_{sim_agg}{exc_suffix}_atk{atk_id if atk_id is not None else 'None'}"
+            custom_run_id = st.text_input("Koşum Adı:", value=default_name)
+            
+            if st.button("🚀 Simülasyonu Koş ve Kaydet", use_container_width=True):
+                with st.spinner("15 turluk federasyon simüle ediliyor..."):
+                    import importlib
+                    import fake_run_generator
+                    importlib.reload(fake_run_generator)
+                    fake_run_generator.generate_run(
+                        run_id=custom_run_id,
+                        aggregation=sim_agg,
+                        attack_client=atk_id,
+                        num_rounds=15,
+                        seed=42,
+                        excluded_clients=exc_centers
+                    )
+                    st.session_state["active_run"] = custom_run_id
+                    st.success(f"'{custom_run_id}' başarıyla oluşturuldu!")
+                    st.rerun()
 
     st.divider()
     if st.button("🔄 Sahte Koşumları Yenile"):
@@ -161,14 +248,25 @@ rare_acc = float((cur_global_recalls[5] + cur_global_recalls[6]) / 2.0)  # DF & 
 clients_round = cur_round_info.get("clients", {})
 excluded_count = sum(1 for c in clients_round.values() if c.get("excluded", False))
 
+if selected_round > 0:
+    prev_round_info = rounds_data[selected_round - 1]
+    prev_recalls = prev_round_info.get("global_class_recall", [0]*N_CLASSES)
+    prev_bal = float(np.mean(prev_recalls))
+    prev_rare = float((prev_recalls[5] + prev_recalls[6]) / 2.0)
+    delta_bal = f"{(bal_acc - prev_bal):+.1%} (önceki tura göre)"
+    delta_rare = f"{(rare_acc - prev_rare):+.1%} (önceki tura göre)"
+else:
+    delta_bal = None
+    delta_rare = None
+
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Tur İlerlemesi", f"{selected_round + 1} / {total_rounds}")
 with col2:
-    st.metric("Dengeli Doğruluk (Bal. Acc)", f"{bal_acc:.1%}", delta=f"{(bal_acc - 0.5):+.1%}")
+    st.metric("Dengeli Doğruluk (Bal. Acc)", f"{bal_acc:.1%}", delta=delta_bal)
 with col3:
     st.metric("Nadir Sınıf Ortalaması (DF & VASC)", f"{rare_acc:.1%}", 
-              delta=f"{(rare_acc - 0.5):+.1%}", 
+              delta=delta_rare, 
               delta_color="normal" if rare_acc >= 0.4 else "inverse")
 with col4:
     st.metric("Dışlanan / Kırpılan Merkez", f"{excluded_count} / {N_CLIENTS}")
@@ -279,99 +377,177 @@ with tab3:
     Aşağıdan incelenecek / dışlanacak hastane(leri) seçerek dışlamanın hangi hastalığa ne kadara mal olacağını karar anında görün.
     """)
 
-    p_col1, p_col2 = st.columns([1, 2])
-    with p_col1:
-        target_ks = st.multiselect(
-            "İncelenecek / Dışlanacak Merkez(ler):",
-            range(N_CLIENTS),
-            default=[2],
-            format_func=lambda x: f"Center {x} {'(Nadir Sınıf Taşıyıcısı)' if x == 2 else '(Cihaz Farkı)' if x == 4 else ''}"
-        )
-        rule_choice = cur_meta.get("aggregation", "trimmed")
-        st.write(f"Kullanılan Toplama Kuralı: **{rule_choice.upper()}**")
+    st.info("""
+    ℹ️ **Metodolojik Not (RQ3 — Tek Turluk Yeniden Toplama Tahmini):**  
+    Bu önizleme, dışlanan merkez(ler) olmadan tüm federasyonu sıfırdan 15 tur **yeniden eğitmek yerine**, mevcut turdaki istemci ağırlıklarını anlık olarak yeniden toplar (*One-Round Counterfactual Re-aggregation*).  
+    Fed-ISIC2019 üzerinde bu hızlı operasyonel tahmin ile tam yeniden eğitim (*Ground Truth Retraining / LOO*) arasındaki korelasyon $r \\approx 0.45$'tir. Önizleme hızlı bir operasyonel karar desteğidir; mutlak koalisyon Shapley değeri değildir.
+    """)
 
-    if not target_ks:
-        st.info("Lütfen önizleme için en az bir merkez seçin.")
+    updates_dir = RUNS_DIR / selected_run / "updates"
+    has_updates = updates_dir.exists() and any(updates_dir.glob("*.npy"))
+    if not has_updates:
+        st.warning(f"⚠️ **Model Güncellemeleri Bulunamadı:** `{selected_run}` koşusunda `updates/` klasörü yer almıyor. "
+                   "Parametre tarama (sweep_*) koşularında disk alanı tasarrufu için ağırlık matrisleri kaydedilmemiş veya silinmiş olabilir. "
+                   "Dışlama önizlemesi yalnızca ağırlıkları saklanan tekil koşularda çalışır.")
     else:
-        # Run preview calculation
-        with st.spinner("Ağırlıklar üzerinden dışlama önizlemesi hesaplanıyor..."):
-            try:
-                prev_result = preview.preview_exclusion(
-                    run_id=selected_run,
-                    round_t=selected_round,
-                    excluded_clients=target_ks,
-                    rule=rule_choice
-                )
-            except Exception as e:
-                st.error(f"Önizleme hesaplanırken hata oluştu: {e}")
-                prev_result = None
-
-        if prev_result:
-            diag = prev_result["diagnosis"]
-            expl = prev_result["explanation"]
-
-            if diag == "VALUABLE_MAVERICK":
-                st.error(f"🚨 **DİKKAT — DEĞERLİ AYKIRI MERKEZ (MAVERICK):** {expl}")
-            elif diag == "HARMFUL_ATTACKER":
-                st.warning(f"🛡️ **ZARARLI İSTEMCİ TESPİTİ:** {expl}")
-            else:
-                st.info(f"ℹ️ **STANDART MERKEZ:** {expl}")
-
-            # Waterfall / Bar chart of Class Costs
-            costs = prev_result["class_costs"]
-            deltas = prev_result["delta_recalls"]
-
-            df_cost = pd.DataFrame({
-                "Sınıf": CLASS_NAMES,
-                "Maliyet (Kayıp)": costs,
-                "Değişim": deltas,
-                "Renk": ["#D32F2F" if c > 0.03 else "#388E3C" if c < -0.03 else "#757575" for c in costs]
-            })
-
-            target_str = ", ".join(f"Center {k}" for k in target_ks)
-            fig_bar = go.Figure()
-            fig_bar.add_trace(go.Bar(
-                x=df_cost["Sınıf"],
-                y=df_cost["Değişim"] * 100,
-                marker_color=df_cost["Renk"],
-                text=[f"{v:+.1f}%" for v in (df_cost["Değişim"] * 100)],
-                textposition="auto"
-            ))
-            fig_bar.update_layout(
-                title=f"{target_str} Dışlandığında Sınıf Başına Recall Değişimi (%)",
-                yaxis_title="Recall Değişimi (%) — Eksi Değer Kaybı Gösterir",
-                height=380
+        p_col1, p_col2 = st.columns([1, 2])
+        with p_col1:
+            target_ks = st.multiselect(
+                "İncelenecek / Dışlanacak Merkez(ler):",
+                range(N_CLIENTS),
+                default=[2],
+                format_func=lambda x: f"Center {x} {'(Nadir Sınıf Taşıyıcısı)' if x == 2 else '(Cihaz Farkı)' if x == 4 else ''}"
             )
-            st.plotly_chart(fig_bar, use_container_width=True)
+            rule_choice = cur_meta.get("aggregation") or cur_meta.get("agg", "trimmed")
+            st.write(f"Kullanılan Toplama Kuralı: **{rule_choice.upper()}**")
 
-            # Karar Alma Paneli
-            st.markdown("### ⚖️ Operatör Kararı ve Denetim Kaydı")
-            st.caption("Vereceğiniz karar, sınıf bazlı gerekçesiyle birlikte sistem denetim izine (Audit Trail) kalıcı olarak işlenecektir.")
+        if not target_ks:
+            st.info("Lütfen önizleme için en az bir merkez seçin.")
+        else:
+            # Run preview calculation with real client sizes
+            with st.spinner("Ağırlıklar üzerinden dışlama önizlemesi hesaplanıyor..."):
+                try:
+                    import importlib
+                    importlib.reload(preview)
+                    prev_result = preview.preview_exclusion(
+                        run_id=selected_run,
+                        round_t=selected_round,
+                        excluded_clients=target_ks,
+                        rule=rule_choice,
+                        client_sizes=cur_sizes
+                    )
+                except Exception as e:
+                    st.error(f"Önizleme hesaplanırken hata oluştu: {e}")
+                    prev_result = None
 
-            col_dec1, col_dec2 = st.columns([2, 1])
-            with col_dec1:
-                op_note = st.text_input("Karar Gerekçesi / Operatör Notu:", 
-                                        value="Nadir hastalık sınıflarındaki (DF/VASC) kritik kaybı önlemek için istisna uygulandı." if diag == "VALUABLE_MAVERICK" else "Güvenlik gereği dışlama onaylandı.")
-            with col_dec2:
-                st.write("")
-                st.write("")
-                prev_summary = {
-                    "diagnosis": diag,
-                    "rare_cost_str": f"DF: {costs[5]:+.1%}, VASC: {costs[6]:+.1%}",
-                    "bal_acc_delta": f"{prev_result['bal_acc_delta']:+.1%}"
-                }
+            if prev_result:
+                diag = prev_result["diagnosis"]
+                expl = prev_result["explanation"]
 
-                b_col1, b_col2 = st.columns(2)
-                with b_col1:
-                    if st.button("🚫 DIŞLA", use_container_width=True):
-                        for k_id in target_ks:
-                            audit_log.log_decision(selected_run, selected_round, k_id, "EXCLUDED", op_note, prev_summary)
-                        st.success(f"{target_str} dışlandı ve denetim kaydına yazıldı!")
-                with b_col2:
-                    if st.button("✅ FEDERASYONDA TUT", use_container_width=True):
-                        for k_id in target_ks:
-                            audit_log.log_decision(selected_run, selected_round, k_id, "RETAINED", op_note, prev_summary)
-                        st.success(f"{target_str} için istisna tanımlandı ve tutuldu!")
+                if diag == "VALUABLE_MAVERICK":
+                    st.error(f"🚨 **DİKKAT — DEĞERLİ AYKIRI MERKEZ (MAVERICK):** {expl}")
+                elif diag == "HARMFUL_ATTACKER":
+                    st.warning(f"🛡️ **ZARARLI İSTEMCİ TESPİTİ:** {expl}")
+                else:
+                    st.info(f"ℹ️ **STANDART MERKEZ:** {expl}")
+
+                # Waterfall / Bar chart of Class Costs
+                costs = prev_result["class_costs"]
+                deltas = prev_result["delta_recalls"]
+
+                df_cost = pd.DataFrame({
+                    "Sınıf": CLASS_NAMES,
+                    "Maliyet (Kayıp)": costs,
+                    "Değişim": deltas,
+                    "Renk": ["#D32F2F" if c > 0.03 else "#388E3C" if c < -0.03 else "#757575" for c in costs]
+                })
+
+                target_str = ", ".join(f"Center {k}" for k in target_ks)
+                fig_bar = go.Figure()
+                fig_bar.add_trace(go.Bar(
+                    x=df_cost["Sınıf"],
+                    y=df_cost["Değişim"] * 100,
+                    marker_color=df_cost["Renk"],
+                    text=[f"{v:+.1f}%" for v in (df_cost["Değişim"] * 100)],
+                    textposition="auto"
+                ))
+                fig_bar.update_layout(
+                    title=f"{target_str} Dışlandığında Sınıf Başına Recall Değişimi (%)",
+                    yaxis_title="Recall Değişimi (%) — Eksi Değer Kaybı Gösterir",
+                    height=380
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+                # Ground Truth LOO comparison (RQ3) if reference exists and single center selected
+                ref_coalition_path = Path("reference/coalition_recall_seeds.npy")
+                if ref_coalition_path.exists() and len(target_ks) == 1:
+                    tgt = target_ks[0]
+                    try:
+                        V_seeds = np.load(ref_coalition_path)  # (64, 20, 8)
+                        full_v = V_seeds[63].mean(0)
+                        loo_v = V_seeds[63 ^ (1 << tgt)].mean(0)
+                        loo_costs = full_v - loo_v
+                        
+                        with st.expander(f"🔬 RQ3 Analizi: Merkez {tgt} İçin Önizleme vs Gerçek Yeniden Eğitim (Ground Truth LOO)", expanded=False):
+                            st.caption(
+                                "Şevval'in 20 tohum üzerinden baştan eğittiği tam koalisyon verisi (Ground Truth LOO) ile "
+                                "konsolun tek turluk hızlı ağırlık önizlemesini yan yana kıyaslayın."
+                            )
+                            comp_rows = []
+                            for c_idx, c_name in enumerate(CLASS_NAMES):
+                                comp_rows.append({
+                                    "Sınıf": c_name,
+                                    "Maliyet Türü": "Konsol Önizlemesi (Tek Tur)",
+                                    "Recall Kaybı (%)": costs[c_idx] * 100
+                                })
+                                comp_rows.append({
+                                    "Sınıf": c_name,
+                                    "Maliyet Türü": "Gerçek Yeniden Eğitim (Ground Truth LOO)",
+                                    "Recall Kaybı (%)": float(loo_costs[c_idx]) * 100
+                                })
+                            df_rq3 = pd.DataFrame(comp_rows)
+                            fig_rq3 = px.bar(
+                                df_rq3, x="Sınıf", y="Recall Kaybı (%)", color="Maliyet Türü", barmode="group",
+                                title=f"Merkez {tgt}: Hızlı Önizleme vs 15 Turluk Tam Yeniden Eğitim Maliyeti",
+                                color_discrete_map={"Konsol Önizlemesi (Tek Tur)": "#1E88E5", "Gerçek Yeniden Eğitim (Ground Truth LOO)": "#FF8F00"}
+                            )
+                            fig_rq3.update_layout(height=340)
+                            st.plotly_chart(fig_rq3, use_container_width=True)
+                            st.caption("📌 **Dikkat:** DF (recall ~0.03), SCC (~0.06) ve AK (~0.17) FedAvg tarafından zayıf öğrenildiği için bu sınıfların Shapley değerleri tohum varyansı içindedir.")
+                    except Exception:
+                        pass
+
+                # Karar Alma Paneli
+                st.markdown("### ⚖️ Operatör Kararı ve Denetim Kaydı")
+                st.caption("Vereceğiniz karar, sınıf bazlı gerekçesiyle birlikte sistem denetim izine (Audit Trail) kalıcı olarak işlenecektir.")
+
+                col_dec1, col_dec2 = st.columns([2, 1])
+                default_retain_note = "Hastanenin model katkısı / nadir sınıflara desteği nedeniyle federasyonda tutulmasına karar verildi (İstisna uygulandı)."
+                default_exclude_note = "Zehirleme/saldırı etkisi tespit edildiği için dışlama onaylandı." if diag == "HARMFUL_ATTACKER" else "Güvenlik gereği dışlama onaylandı."
+                
+                with col_dec1:
+                    initial_note = default_retain_note if diag == "VALUABLE_MAVERICK" else default_exclude_note
+                    op_note = st.text_input("Karar Gerekçesi / Operatör Notu:", value=initial_note)
+                with col_dec2:
+                    st.write("")
+                    st.write("")
+                    prev_summary = {
+                        "diagnosis": diag,
+                        "rare_cost_str": f"DF: {costs[5]:+.1%}, VASC: {costs[6]:+.1%}",
+                        "bal_acc_delta": f"{prev_result['bal_acc_delta']:+.1%}"
+                    }
+
+                    b_col1, b_col2 = st.columns(2)
+                    with b_col1:
+                        if st.button("🚫 DIŞLA", use_container_width=True):
+                            note_to_save = default_exclude_note if op_note == default_retain_note else op_note
+                            for k_id in target_ks:
+                                audit_log.log_decision(selected_run, selected_round, k_id, "EXCLUDED", note_to_save, prev_summary)
+                            st.success(f"{target_str} dışlandı ve denetim kaydına yazıldı!")
+                    with b_col2:
+                        if st.button("✅ FEDERASYONDA TUT", use_container_width=True):
+                            note_to_save = default_retain_note if op_note == default_exclude_note else op_note
+                            for k_id in target_ks:
+                                audit_log.log_decision(selected_run, selected_round, k_id, "RETAINED", note_to_save, prev_summary)
+                            st.success(f"{target_str} için istisna tanımlandı ve federasyonda tutuldu!")
+
+        # --- Shapley Ground Truth Referansı (Şevval'in 64 Koalisyonluk Referansı) ---
+        ref_csv_path = Path("reference/shapley_class.csv")
+        ref_img_path = Path("reference/shapley_heatmap.png")
+        if ref_csv_path.exists() or ref_img_path.exists():
+            st.divider()
+            with st.expander("📊 64 Koalisyonluk Tam Shapley Değerleri Referansı (Şevval / Ground Truth)", expanded=False):
+                st.caption("Konsolun hızlı dışlama tahminlerini doğrulamak için 64 koalisyonun tamamı eğitilerek elde edilen kesin matematiksel referans.")
+                r_col1, r_col2 = st.columns([1, 1])
+                with r_col1:
+                    if ref_csv_path.exists():
+                        st.markdown("**Sınıf Bazlı Shapley Tablosu:**")
+                        df_shapley = pd.read_csv(ref_csv_path)
+                        st.dataframe(df_shapley, use_container_width=True)
+                with r_col2:
+                    if ref_img_path.exists():
+                        st.markdown("**Shapley Katkı Isı Haritası (Heatmap):**")
+                        st.image(str(ref_img_path), width="stretch")
 
 # --- TAB 4: Savunma Karşılaştırması (RQ1) ---
 with tab4:
@@ -380,11 +556,23 @@ with tab4:
     Farklı savunma kurallarını veya belirli hastanelerin dışlandığı koşumları yan yana karşılaştırarak sınıf bazlı etkisini inceleyin.
     """)
 
-    default_selected = [r for r in available_runs if r in ['demo_fedavg_clean', 'demo_trimmed_clean', 'demo_krum_clean']]
-    if not default_selected:
-        default_selected = available_runs[:min(3, len(available_runs))]
-        
-    runs_to_compare = st.multiselect("Karşılaştırılacak Koşumlar:", available_runs, default=default_selected)
+    real_runs = [r for r in available_runs if not is_synthetic_run(r)]
+    synthetic_runs = [r for r in available_runs if is_synthetic_run(r)]
+    if len(real_runs) >= 2:
+        default_selected = real_runs[:min(3, len(real_runs))]
+    elif real_runs:
+        default_selected = real_runs + synthetic_runs[:min(2, len(synthetic_runs))]
+    else:
+        default_selected = [r for r in available_runs if r in ['demo_fedavg_clean', 'demo_trimmed_clean', 'demo_krum_clean']]
+        if not default_selected:
+            default_selected = available_runs[:min(3, len(available_runs))]
+
+    runs_to_compare = st.multiselect(
+        "Karşılaştırılacak Koşumlar:",
+        available_runs,
+        default=default_selected,
+        format_func=format_run_label
+    )
 
     if len(runs_to_compare) >= 2:
         comp_data = []

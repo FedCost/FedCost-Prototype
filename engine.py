@@ -61,27 +61,54 @@ def agg_krum(updates, sizes, f=1):
 AGG = {"fedavg": agg_fedavg, "trimmed": agg_trimmed, "krum": agg_krum}
 
 # ---------- Run ----------
-def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None):
+def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clients=None):
     rng = np.random.default_rng(seed)
     run_id = run_id or f"{agg}_atk{attack}_s{seed}"
+    excluded_set = set(excluded_clients or [])
+    active_clients = [k for k in range(N_CLIENTS) if k not in excluded_set]
+    
     data = [load_features(k, "train") for k in range(N_CLIENTS)]
     test = [load_features(k, "test") for k in range(N_CLIENTS)]
-    if attack is not None:                                   # label flipping
+    if attack is not None and attack in active_clients:      # label flipping
         X, y = data[attack]
         data[attack] = (X, (N_CLASSES - 1 - y))
     Xg = np.concatenate([t[0] for t in test]); yg = np.concatenate([t[1] for t in test])
     W = np.zeros((FEAT_DIM + 1, N_CLASSES))
     for t in range(rounds):
-        updates = [local_train(W, X, y, rng=rng) for X, y in data]
-        for k, u in enumerate(updates):
-            save_update(run_id, t, k, u)
-        new_W, info = AGG[agg](updates, [len(d[1]) for d in data])
-        clients = {k: {"class_recall": class_recall(updates[k], *test[k]),   # telemetry: on its own validation data
-                       "update_norm": float(np.linalg.norm(updates[k] - W)),
-                       "excluded": info[k][0], "reason": info[k][1]} for k in range(N_CLIENTS)}
+        active_updates = []
+        active_sizes = []
+        updates_map = {}
+        for k in range(N_CLIENTS):
+            if k in active_clients:
+                u_k = local_train(W, data[k][0], data[k][1], rng=rng)
+                save_update(run_id, t, k, u_k)
+                active_updates.append(u_k)
+                active_sizes.append(len(data[k][1]))
+                updates_map[k] = u_k
+            else:
+                updates_map[k] = W.copy()
+        
+        if active_updates:
+            new_W, info_active = AGG[agg](active_updates, active_sizes)
+        else:
+            new_W, info_active = W, {idx: (False, None) for idx in range(len(active_updates))}
+
+        clients = {}
+        for idx, k in enumerate(active_clients):
+            clients[k] = {"class_recall": class_recall(updates_map[k], *test[k]),   # telemetry: on its own validation data
+                           "update_norm": float(np.linalg.norm(updates_map[k] - W)),
+                           "excluded": info_active[idx][0], "reason": info_active[idx][1]}
+        for k in excluded_set:
+            clients[k] = {"class_recall": [0.0] * N_CLASSES,
+                           "update_norm": 0.0,
+                           "excluded": True, "reason": "Manuel dışlama (Koalisyon deneyi / LOO)"}
+
         W = new_W
         gr = class_recall(W, Xg, yg)
-        save_round(run_id, t, clients, gr, {"agg": agg, "attack": attack, "seed": seed})
+        meta = {"agg": agg, "attack": attack, "seed": seed}
+        if excluded_set:
+            meta["excluded_clients"] = list(excluded_set)
+        save_round(run_id, t, clients, gr, meta)
     bal = np.nanmean(gr)
     print(f"{run_id}: balanced acc={bal:.3f} | class recall={np.round(gr, 2).tolist()}")
     return W
