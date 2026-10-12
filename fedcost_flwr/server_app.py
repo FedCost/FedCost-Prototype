@@ -19,7 +19,7 @@ def main(grid: Grid, context: Context) -> None:
     atk = None if attack < 0 else attack
     run_id = f"flwr_{agg}_atk{atk}_s{seed}"
 
-    strategy = FedCostStrategy(agg, run_id, {"agg": agg, "attack": atk, "seed": seed})
+    strategy = FedCostStrategy(agg, run_id, atk, seed)
     W0 = np.zeros((FEAT_DIM + 1, N_CLASSES))
     strategy.start(grid=grid, initial_arrays=ArrayRecord.from_numpy_ndarrays([W0]),
                    num_rounds=rounds, train_config=ConfigRecord({"seed": seed, "attack": attack}))

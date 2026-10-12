@@ -10,17 +10,17 @@ from flwr.serverapp.strategy import FedAvg
 from flwr.supercore import log
 
 from contract import N_CLASSES, N_CLIENTS, save_round, save_update
-from engine import AGG
+from engine import AGG, run_meta
 
 
 class FedCostStrategy(FedAvg):
-    def __init__(self, agg: str, run_id: str, meta: dict, n_clients: int = N_CLIENTS):
+    def __init__(self, agg: str, run_id: str, attack: int | None, seed: int, n_clients: int = N_CLIENTS):
         super().__init__(fraction_train=1.0, fraction_evaluate=1.0,
                          min_train_nodes=n_clients, min_evaluate_nodes=n_clients,
                          min_available_nodes=n_clients)
-        self.agg, self.run_id, self.meta = agg, run_id, meta
+        self.agg, self.run_id, self.attack, self.seed = agg, run_id, attack, seed
         self._W = None                 # global model at the start of the round (for update_norm)
-        self._pending = None           # (t, client telemetry): completed in the evaluation round
+        self._pending = None           # (t, client telemetry, meta): completed in the evaluation round
         self.last_global_recall = None
 
     def configure_train(self, server_round: int, arrays: ArrayRecord,
@@ -51,7 +51,7 @@ class FedCostStrategy(FedAvg):
             clients[cid] = {"class_recall": list(m.content["metrics"]["class-recall"]),
                             "update_norm": float(np.linalg.norm(ups[i] - self._W)),
                             "excluded": info[i][0], "reason": info[i][1]}
-        self._pending = (t, clients)
+        self._pending = (t, clients, run_meta(self.agg, self.attack, self.seed, sizes))
         n_ex = sum(c["excluded"] for c in clients.values())
         log(INFO, "Round %d: aggregated with %s, number of excluded clients: %d", t, self.agg, n_ex)
         return ArrayRecord.from_numpy_ndarrays([new_W]), MetricRecord({"num-excluded": n_ex})
@@ -64,8 +64,8 @@ class FedCostStrategy(FedAvg):
         count = np.sum([m.content["metrics"]["count"] for m in ok], axis=0)
         with np.errstate(invalid="ignore", divide="ignore"):
             gr = np.where(count > 0, correct / count, np.nan)
-        t, clients = self._pending
-        save_round(self.run_id, t, clients, gr, self.meta)
+        t, clients, meta = self._pending
+        save_round(self.run_id, t, clients, gr, meta)
         self.last_global_recall = gr
         self._pending = None
         return MetricRecord({"balanced-acc": float(np.nanmean(gr))})

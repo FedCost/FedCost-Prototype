@@ -102,7 +102,8 @@ def test_run_writes_contract_conformant_output(mini_features, agg):
         assert len(c["class_recall"]) == N_CLASSES
         assert {"update_norm", "excluded", "reason"} <= set(c)
     assert len(rec["global_class_recall"]) == N_CLASSES
-    assert rec["meta"] == {"agg": agg, "attack": 0, "seed": 3}
+    assert rec["meta"] == {"agg": agg, "attack": 0, "seed": 3, "aggregation": agg, "attack_client": 0,
+                           "client_sizes": [80] * N_CLIENTS}
     W = contract.load_update("t", 1, 0)
     assert W.shape == (FEAT_DIM + 1, N_CLASSES) and W.dtype == np.float32
 
@@ -111,3 +112,14 @@ def test_run_is_reproducible_with_seed(mini_features):
     W1 = engine.run("trimmed", rounds=2, seed=7, run_id="a")
     W2 = engine.run("trimmed", rounds=2, seed=7, run_id="b")
     assert np.array_equal(W1, W2)
+
+
+def test_run_leaves_excluded_clients_out(mini_features):
+    engine.run("fedavg", rounds=1, attack=2, seed=3, run_id="loo", excluded_clients=[2, 4])
+    rd = mini_features / "runs" / "loo"
+    rec = json.loads((rd / "round_0.json").read_text())
+    assert rec["meta"]["excluded_clients"] == [2, 4]
+    assert sorted(p.name for p in (rd / "updates").iterdir()) == [f"r0_c{k}.npy" for k in (0, 1, 3, 5)]
+    assert [rec["clients"][str(k)]["excluded"] for k in range(N_CLIENTS)] == [k in (2, 4) for k in range(N_CLIENTS)]
+    with pytest.raises(ValueError):
+        engine.run("fedavg", rounds=1, run_id="empty", excluded_clients=range(N_CLIENTS))

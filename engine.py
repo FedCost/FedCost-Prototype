@@ -61,53 +61,47 @@ def agg_krum(updates, sizes, f=1):
 AGG = {"fedavg": agg_fedavg, "trimmed": agg_trimmed, "krum": agg_krum}
 
 # ---------- Run ----------
+def run_meta(agg, attack, seed, sizes=None, excluded_clients=()):
+    """Round-log meta. 'aggregation'/'attack_client' are the keys the console reads; 'client_sizes' are the
+    train set sizes in center order, which the exclusion preview needs to reproduce size-weighted FedAvg."""
+    meta = {"agg": agg, "attack": attack, "seed": seed, "aggregation": agg, "attack_client": attack}
+    if sizes is not None:
+        meta["client_sizes"] = [int(s) for s in sizes]
+    if excluded_clients:
+        meta["excluded_clients"] = sorted(int(k) for k in excluded_clients)
+    return meta
+
 def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clients=None):
+    """excluded_clients: centers left out of training for the whole run (leave-one-out / custom coalition).
+    They are still part of the pooled test set and appear in the log as excluded, without an update file."""
     rng = np.random.default_rng(seed)
     run_id = run_id or f"{agg}_atk{attack}_s{seed}"
-    excluded_set = set(excluded_clients or [])
-    active_clients = [k for k in range(N_CLIENTS) if k not in excluded_set]
-    
+    left_out = set(excluded_clients or [])
+    active = [k for k in range(N_CLIENTS) if k not in left_out]
+    if not active:
+        raise ValueError("at least one center must stay in the coalition")
     data = [load_features(k, "train") for k in range(N_CLIENTS)]
     test = [load_features(k, "test") for k in range(N_CLIENTS)]
-    if attack is not None and attack in active_clients:      # label flipping
+    if attack in active:                                     # label flipping
         X, y = data[attack]
         data[attack] = (X, (N_CLASSES - 1 - y))
     Xg = np.concatenate([t[0] for t in test]); yg = np.concatenate([t[1] for t in test])
+    sizes = [len(d[1]) for d in data]
+    meta = run_meta(agg, attack, seed, sizes, left_out)
     W = np.zeros((FEAT_DIM + 1, N_CLASSES))
     for t in range(rounds):
-        active_updates = []
-        active_sizes = []
-        updates_map = {}
-        for k in range(N_CLIENTS):
-            if k in active_clients:
-                u_k = local_train(W, data[k][0], data[k][1], rng=rng)
-                save_update(run_id, t, k, u_k)
-                active_updates.append(u_k)
-                active_sizes.append(len(data[k][1]))
-                updates_map[k] = u_k
-            else:
-                updates_map[k] = W.copy()
-        
-        if active_updates:
-            new_W, info_active = AGG[agg](active_updates, active_sizes)
-        else:
-            new_W, info_active = W, {idx: (False, None) for idx in range(len(active_updates))}
-
-        clients = {}
-        for idx, k in enumerate(active_clients):
-            clients[k] = {"class_recall": class_recall(updates_map[k], *test[k]),   # telemetry: on its own validation data
-                           "update_norm": float(np.linalg.norm(updates_map[k] - W)),
-                           "excluded": info_active[idx][0], "reason": info_active[idx][1]}
-        for k in excluded_set:
-            clients[k] = {"class_recall": [0.0] * N_CLASSES,
-                           "update_norm": 0.0,
-                           "excluded": True, "reason": "Manuel dışlama (Koalisyon deneyi / LOO)"}
-
+        updates = [local_train(W, *data[k], rng=rng) for k in active]
+        for k, u in zip(active, updates):
+            save_update(run_id, t, k, u)
+        new_W, info = AGG[agg](updates, [sizes[k] for k in active])   # info indices follow list order
+        clients = {k: {"class_recall": class_recall(u, *test[k]),    # telemetry: on its own validation data
+                       "update_norm": float(np.linalg.norm(u - W)),
+                       "excluded": info[i][0], "reason": info[i][1]} for i, (k, u) in enumerate(zip(active, updates))}
+        for k in left_out:
+            clients[k] = {"class_recall": [float("nan")] * N_CLASSES, "update_norm": 0.0,
+                          "excluded": True, "reason": "left out of the coalition"}
         W = new_W
         gr = class_recall(W, Xg, yg)
-        meta = {"agg": agg, "attack": attack, "seed": seed}
-        if excluded_set:
-            meta["excluded_clients"] = list(excluded_set)
         save_round(run_id, t, clients, gr, meta)
     bal = np.nanmean(gr)
     print(f"{run_id}: balanced acc={bal:.3f} | class recall={np.round(gr, 2).tolist()}")

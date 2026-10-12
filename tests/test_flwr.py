@@ -45,8 +45,7 @@ def ask(fn, kind, cid, W, cfg, root):
 
 
 def one_round(agg, root, attack=-1, seed=3, order=range(N_CLIENTS)):
-    meta = {"agg": agg, "attack": None if attack < 0 else attack, "seed": seed}
-    strategy = FedCostStrategy(agg, "t", meta)
+    strategy = FedCostStrategy(agg, "t", None if attack < 0 else attack, seed)
     W0 = np.zeros((FEAT_DIM + 1, N_CLASSES))
     strategy._W = W0                                           # set by configure_train in a real run
     cfg = {"server-round": 1, "seed": seed, "attack": attack}
@@ -65,7 +64,8 @@ def test_round_writes_contract_conformant_output(project, agg):
     for c in rec["clients"].values():
         assert len(c["class_recall"]) == N_CLASSES and c["update_norm"] > 0
         assert isinstance(c["excluded"], bool)
-    assert rec["meta"] == {"agg": agg, "attack": 0, "seed": 3}
+    assert rec["meta"] == {"agg": agg, "attack": 0, "seed": 3, "aggregation": agg, "attack_client": 0,
+                           "client_sizes": [80] * N_CLIENTS}
     assert metrics["balanced-acc"] == pytest.approx(np.nanmean(rec["global_class_recall"]))
     for k in range(N_CLIENTS):
         assert contract.load_update("t", 0, k).shape == (FEAT_DIM + 1, N_CLASSES)
