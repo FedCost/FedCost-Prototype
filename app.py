@@ -12,8 +12,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from contract import (
-    CLASS_NAMES, N_CLASSES, N_CLIENTS, RUNS_DIR
+    CLASS_NAMES, N_CLASSES, N_CLIENTS, RUNS_DIR, FEATURES_DIR
 )
+import contract
 import preview
 import audit_log
 
@@ -177,42 +178,51 @@ with st.sidebar:
         sim_agg = st.selectbox("Savunma Kuralı:", ["fedavg", "trimmed", "krum"], index=0)
         sim_attack = st.selectbox("Saldırı Senaryosu:", ["Yok", "Center 0 (Etiket Çevirme)"], index=0)
         atk_id = 0 if "Center 0" in sim_attack else None
+        sim_seed = st.number_input("Rastgele Tohum (Seed):", min_value=0, max_value=999, value=0, step=1,
+                                   help="Referans deneyler 0–19 tohumları arasındadır.")
 
         exc_suffix = f"_no_c{'_c'.join(map(str, exc_centers))}" if exc_centers else ""
 
         if run_mode == "🟢 Gerçek Motor (engine.py)":
             st.info("💡 **Gerçek Motor:** Umut'un EfficientNet öznitelikleri üzerinde çalışan saf NumPy federasyon motorunu (SGD, yerel epochlar, gerçek gradyanlar) çalıştırır.")
             sim_rounds = st.slider("Tur Sayısı:", min_value=5, max_value=30, value=15, step=5)
-            default_name = f"engine_{sim_agg}{exc_suffix}_atk{atk_id if atk_id is not None else 'None'}"
+            default_name = f"engine_{sim_agg}{exc_suffix}_atk{atk_id if atk_id is not None else 'None'}_s{sim_seed}"
             custom_run_id = st.text_input("Koşum Adı:", value=default_name)
             
             if st.button("🚀 Gerçek Motoru Çalıştır", use_container_width=True):
-                with st.spinner(f"Gerçek federasyon motoru {sim_rounds} tur eğitiliyor..."):
-                    from pathlib import Path
-                    import contract
-                    # Ensure features exist
-                    feats_dir = contract.FEATURES_DIR
-                    if not (feats_dir.exists() and (feats_dir / "center_0_train.npz").exists()):
-                        import synthetic
-                        synthetic.make()
-                    
-                    import importlib
-                    import engine
-                    importlib.reload(engine)
-                    engine.run(
-                        agg=sim_agg,
-                        rounds=sim_rounds,
-                        attack=atk_id,
-                        seed=42,
-                        run_id=custom_run_id,
-                        excluded_clients=exc_centers
+                feats_dir = FEATURES_DIR
+                missing_feats = [
+                    f"center_{k}_{split}.npz"
+                    for k in range(N_CLIENTS)
+                    for split in ("train", "test")
+                    if not (feats_dir / f"center_{k}_{split}.npz").exists()
+                ]
+                if missing_feats:
+                    st.error(
+                        f"❌ **Gerçek Öznitelikler Bulunamadı:** `features/` dizininde {len(missing_feats)} adet dosya eksik "
+                        f"(ilk eksik: `{missing_feats[0]}`). Gerçek federasyon motoru yalnızca Fed-ISIC2019 EfficientNet "
+                        "öznitelikleriyle çalışabilir. Lütfen öznitelikleri `features/` klasörüne aktarın veya "
+                        "simülasyon için '🧪 Hızlı Sentetik Simülasyon' modunu seçin."
                     )
-                    st.session_state["active_run"] = custom_run_id
-                    st.success(f"'{custom_run_id}' gerçek motor ile eğitildi ve kaydedildi!")
-                    st.rerun()
+                else:
+                    with st.spinner(f"Gerçek federasyon motoru {sim_rounds} tur eğitiliyor..."):
+                        import importlib
+                        import engine
+                        importlib.reload(engine)
+                        engine.run(
+                            agg=sim_agg,
+                            rounds=sim_rounds,
+                            attack=atk_id,
+                            seed=int(sim_seed),
+                            run_id=custom_run_id,
+                            excluded_clients=exc_centers
+                        )
+                        st.session_state["active_run"] = custom_run_id
+                        st.success(f"'{custom_run_id}' gerçek motor ile eğitildi ve kaydedildi!")
+                        st.rerun()
         else:
             st.caption("Sentetik dağılımlar üzerinden anlık simülasyon üretir.")
-            default_name = f"sim_{sim_agg}{exc_suffix}_atk{atk_id if atk_id is not None else 'None'}"
+            default_name = f"sim_{sim_agg}{exc_suffix}_atk{atk_id if atk_id is not None else 'None'}_s{sim_seed}"
             custom_run_id = st.text_input("Koşum Adı:", value=default_name)
             
             if st.button("🚀 Simülasyonu Koş ve Kaydet", use_container_width=True):
@@ -225,7 +235,7 @@ with st.sidebar:
                         aggregation=sim_agg,
                         attack_client=atk_id,
                         num_rounds=15,
-                        seed=42,
+                        seed=int(sim_seed),
                         excluded_clients=exc_centers
                     )
                     st.session_state["active_run"] = custom_run_id
@@ -332,15 +342,18 @@ with tab2:
     for k in range(N_CLIENTS):
         c_info = clients_round.get(str(k), {})
         c_recalls = c_info.get("class_recall", [0]*N_CLASSES)
+        def fmt_rec(v):
+            return "—" if (v is None or np.isnan(v)) else f"{v:.1%}"
+
         client_rows.append({
             "Merkez": f"Center {k}",
             "Güncelleme Normu": c_info.get("update_norm", 0.0),
             "Durum": "DIŞLANDI / KIRPILDI" if c_info.get("excluded", False) else "DAHİL",
             "Gerekçe": c_info.get("reason") or "Normal varyans içinde",
-            "MEL": f"{c_recalls[0]:.1%}",
-            "NV": f"{c_recalls[1]:.1%}",
-            "DF (Nadir)": f"{c_recalls[5]:.1%}",
-            "VASC (Nadir)": f"{c_recalls[6]:.1%}"
+            "MEL": fmt_rec(c_recalls[0]),
+            "NV": fmt_rec(c_recalls[1]),
+            "DF (Nadir)": fmt_rec(c_recalls[5]),
+            "VASC (Nadir)": fmt_rec(c_recalls[6])
         })
     df_clients = pd.DataFrame(client_rows)
 
@@ -379,8 +392,8 @@ with tab3:
 
     st.info("""
     ℹ️ **Metodolojik Not (RQ3 — Tek Turluk Yeniden Toplama Tahmini):**  
-    Bu önizleme, dışlanan merkez(ler) olmadan tüm federasyonu sıfırdan 15 tur **yeniden eğitmek yerine**, mevcut turdaki istemci ağırlıklarını anlık olarak yeniden toplar (*One-Round Counterfactual Re-aggregation*).  
-    Fed-ISIC2019 üzerinde bu hızlı operasyonel tahmin ile tam yeniden eğitim (*Ground Truth Retraining / LOO*) arasındaki korelasyon $r \\approx 0.45$'tir. Önizleme hızlı bir operasyonel karar desteğidir; mutlak koalisyon Shapley değeri değildir.
+    Bu önizleme, dışlanan merkez(ler) olmadan tüm federasyonu baştan 15 tur **yeniden eğitmek yerine**, mevcut turdaki istemci ağırlıklarını anlık olarak yeniden toplar (*One-Round Counterfactual Re-aggregation*).  
+    Bu hızlı operasyonel tahmin tek turluk ağırlık gradyanlarına dayanır (pilot ölçüm: seed 0, tur 14, FedAvg için $r \\approx 0.45$; 20-seed genelleme analizi hesaplanmaktadır). Önizleme anlık bir operasyonel karar desteğidir; mutlak koalisyon Shapley değeri değildir.
     """)
 
     updates_dir = RUNS_DIR / selected_run / "updates"
@@ -421,15 +434,8 @@ with tab3:
                     prev_result = None
 
             if prev_result:
-                diag = prev_result["diagnosis"]
                 expl = prev_result["explanation"]
-
-                if diag == "VALUABLE_MAVERICK":
-                    st.error(f"🚨 **DİKKAT — DEĞERLİ AYKIRI MERKEZ (MAVERICK):** {expl}")
-                elif diag == "HARMFUL_ATTACKER":
-                    st.warning(f"🛡️ **ZARARLI İSTEMCİ TESPİTİ:** {expl}")
-                else:
-                    st.info(f"ℹ️ **STANDART MERKEZ:** {expl}")
+                st.info(f"📊 **Dışlama Etki Özeti:** {expl}")
 
                 # Waterfall / Bar chart of Class Costs
                 costs = prev_result["class_costs"]
@@ -458,9 +464,19 @@ with tab3:
                 )
                 st.plotly_chart(fig_bar, use_container_width=True)
 
-                # Ground Truth LOO comparison (RQ3) if reference exists and single center selected
+                # Ground Truth LOO comparison (RQ3) - ONLY shown for clean FedAvg run
                 ref_coalition_path = Path("reference/coalition_recall_seeds.npy")
-                if ref_coalition_path.exists() and len(target_ks) == 1:
+                cur_agg_str = str(cur_meta.get("aggregation") or cur_meta.get("agg") or "").lower()
+                cur_atk_val = cur_meta.get("attack_client") if "attack_client" in cur_meta else cur_meta.get("attack")
+                is_clean_fedavg = (
+                    ("fedavg" in cur_agg_str or ("fedavg" in selected_run.lower() and "trimmed" not in selected_run.lower() and "krum" not in selected_run.lower()))
+                    and "trimmed" not in cur_agg_str
+                    and "krum" not in cur_agg_str
+                    and (cur_atk_val is None or str(cur_atk_val).lower() in ["none", "-1", "null", ""])
+                    and ("atk0" not in selected_run and "atk_0" not in selected_run)
+                )
+
+                if ref_coalition_path.exists() and len(target_ks) == 1 and is_clean_fedavg:
                     tgt = target_ks[0]
                     try:
                         V_seeds = np.load(ref_coalition_path)  # (64, 20, 8)
@@ -471,7 +487,7 @@ with tab3:
                         with st.expander(f"🔬 RQ3 Analizi: Merkez {tgt} İçin Önizleme vs Gerçek Yeniden Eğitim (Ground Truth LOO)", expanded=False):
                             st.caption(
                                 "Şevval'in 20 tohum üzerinden baştan eğittiği tam koalisyon verisi (Ground Truth LOO) ile "
-                                "konsolun tek turluk hızlı ağırlık önizlemesini yan yana kıyaslayın."
+                                "konsolun tek turluk hızlı ağırlık önizlemesini yan yana kıyaslayın (Yalnızca saldırısız FedAvg referansı)."
                             )
                             comp_rows = []
                             for c_idx, c_name in enumerate(CLASS_NAMES):
@@ -502,17 +518,16 @@ with tab3:
                 st.caption("Vereceğiniz karar, sınıf bazlı gerekçesiyle birlikte sistem denetim izine (Audit Trail) kalıcı olarak işlenecektir.")
 
                 col_dec1, col_dec2 = st.columns([2, 1])
-                default_retain_note = "Hastanenin model katkısı / nadir sınıflara desteği nedeniyle federasyonda tutulmasına karar verildi (İstisna uygulandı)."
-                default_exclude_note = "Zehirleme/saldırı etkisi tespit edildiği için dışlama onaylandı." if diag == "HARMFUL_ATTACKER" else "Güvenlik gereği dışlama onaylandı."
+                default_retain_note = "Model katkısı ve azınlık sınıfları koruma amacıyla federasyonda tutuldu (İstisna uygulandı)."
+                default_exclude_note = "Model kararlılığı ve sınıf başarım dengesi gözetilerek dışlama onaylandı."
                 
                 with col_dec1:
-                    initial_note = default_retain_note if diag == "VALUABLE_MAVERICK" else default_exclude_note
-                    op_note = st.text_input("Karar Gerekçesi / Operatör Notu:", value=initial_note)
+                    op_note = st.text_input("Karar Gerekçesi / Operatör Notu:", value=default_exclude_note)
                 with col_dec2:
                     st.write("")
                     st.write("")
                     prev_summary = {
-                        "diagnosis": diag,
+                        "explanation": expl,
                         "rare_cost_str": f"DF: {costs[5]:+.1%}, VASC: {costs[6]:+.1%}",
                         "bal_acc_delta": f"{prev_result['bal_acc_delta']:+.1%}"
                     }
@@ -520,9 +535,8 @@ with tab3:
                     b_col1, b_col2 = st.columns(2)
                     with b_col1:
                         if st.button("🚫 DIŞLA", use_container_width=True):
-                            note_to_save = default_exclude_note if op_note == default_retain_note else op_note
                             for k_id in target_ks:
-                                audit_log.log_decision(selected_run, selected_round, k_id, "EXCLUDED", note_to_save, prev_summary)
+                                audit_log.log_decision(selected_run, selected_round, k_id, "EXCLUDED", op_note, prev_summary)
                             st.success(f"{target_str} dışlandı ve denetim kaydına yazıldı!")
                     with b_col2:
                         if st.button("✅ FEDERASYONDA TUT", use_container_width=True):
@@ -557,15 +571,26 @@ with tab4:
     """)
 
     real_runs = [r for r in available_runs if not is_synthetic_run(r)]
-    synthetic_runs = [r for r in available_runs if is_synthetic_run(r)]
-    if len(real_runs) >= 2:
-        default_selected = real_runs[:min(3, len(real_runs))]
-    elif real_runs:
-        default_selected = real_runs + synthetic_runs[:min(2, len(synthetic_runs))]
+    candidate_pool = real_runs if len(real_runs) >= 2 else available_runs
+    
+    # Intelligently select FedAvg, Trimmed, Krum across defenses
+    triad = []
+    for def_rule in ["fedavg", "trimmed", "krum"]:
+        match = next(
+            (r for r in candidate_pool if def_rule in r.lower() and ("clean" in r.lower() or "atknone" in r.lower())),
+            None
+        )
+        if not match:
+            match = next((r for r in candidate_pool if def_rule in r.lower()), None)
+        if match and match not in triad:
+            triad.append(match)
+
+    if len(triad) >= 2:
+        default_selected = triad
+    elif len(candidate_pool) >= 2:
+        default_selected = candidate_pool[:min(3, len(candidate_pool))]
     else:
-        default_selected = [r for r in available_runs if r in ['demo_fedavg_clean', 'demo_trimmed_clean', 'demo_krum_clean']]
-        if not default_selected:
-            default_selected = available_runs[:min(3, len(available_runs))]
+        default_selected = available_runs[:min(3, len(available_runs))]
 
     runs_to_compare = st.multiselect(
         "Karşılaştırılacak Koşumlar:",

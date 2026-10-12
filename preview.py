@@ -101,7 +101,9 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         - preview_recalls: predicted per-class recall without excluded_clients
         - delta_recalls: preview_recalls - full_recalls (negative means loss)
         - class_costs: full_recalls - preview_recalls (positive means positive cost/loss)
-        - diagnosis: classification of the client ('VALUABLE_MAVERICK', 'HARMFUL_ATTACKER', 'STANDARD_PEER')
+        - explanation: neutral factual summary of balanced accuracy and class changes
+        - worst_class, worst_delta: class with the greatest drop
+        - best_class, best_delta: class with the greatest gain
     """
     if isinstance(excluded_clients, (int, np.integer)):
         excluded_list = [int(excluded_clients)]
@@ -176,22 +178,14 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         if round_json_data is not None:
             data = round_json_data
             full_recalls = np.array(data.get("global_class_recall", [0.5]*N_CLASSES))
-            attack_c = round_meta.get("attack_client") if "attack_client" in round_meta else round_meta.get("attack")
             
             # Aggregate client penalties for all excluded clients
             total_penalty = np.zeros(N_CLASSES, dtype=float)
             for ex_k in excluded_list:
                 client_data = data.get("clients", {}).get(str(ex_k), {})
                 c_recalls = np.array(client_data.get("class_recall", full_recalls))
-                
-                if attack_c is not None and ex_k == attack_c:
-                    # Excluding the attacker recovers the poisoned performance
-                    total_penalty -= 0.04
-                    total_penalty[0] -= 0.05
-                    total_penalty[2] -= 0.05
-                else:
-                    # Client carrying higher recall than global loses signal when dropped
-                    total_penalty += np.maximum(0, (c_recalls - full_recalls)) * 0.35
+                # Client carrying higher recall than global loses signal when dropped
+                total_penalty += np.maximum(0, (c_recalls - full_recalls)) * 0.35
             
             # Additional penalty if a large fraction of the federation is excluded
             if len(excluded_list) > 1:
@@ -211,46 +205,24 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
     class_costs = -delta_recalls  # Positive cost = performance dropped when excluded
     bal_acc_delta = prev_bal_acc - full_bal_acc
 
-    # 4. Diagnostic classification
-    # In Fed-ISIC2019:
-    # - VASC (6) carries strong signal (~0.40 recall), held mostly by C1 (+0.19) and C2 (+0.17).
-    # - DF (5), SCC (7), AK (3) are barely learned by FedAvg (recall < 0.18, within seed noise).
-    # - Label-flipping attacks on Center 0 poison specific classes, causing negative overall delta.
-    vasc_cost = float(class_costs[6])
-    df_cost = float(class_costs[5])
-    
-    # Attacker check: overall federation balanced accuracy increases when excluded,
-    # and at least one poisoned class shows notable recall recovery.
-    is_attacker = (bal_acc_delta > 0.015 and float(np.min(class_costs)) < -0.03) or (bal_acc_delta > 0.03)
+    # 4. Neutral, objective factual summary (no diagnostic labels)
+    worst_idx = int(np.argmin(delta_recalls))
+    worst_delta = float(delta_recalls[worst_idx])
+    worst_cls = CLASS_NAMES[worst_idx]
 
-    # Maverick check: carries critical signal on rare/minority classes (VASC, DF)
-    rare_loss = (vasc_cost > 0.05) or (df_cost > 0.02) or ((vasc_cost + df_cost) > 0.04)
-    is_maverick = rare_loss and not is_attacker
+    best_idx = int(np.argmax(delta_recalls))
+    best_delta = float(delta_recalls[best_idx])
+    best_cls = CLASS_NAMES[best_idx]
 
-    excluded_str = ", ".join(f"Center {k}" for k in excluded_list)
-    if is_maverick:
-        diagnosis = "VALUABLE_MAVERICK"
-        top_loss_idx = int(np.argmax(class_costs))
-        top_loss_cls = CLASS_NAMES[top_loss_idx]
-        top_loss_val = float(class_costs[top_loss_idx])
-        explanation = (
-            f"Seçili merkezler ({excluded_str}) nadir veya azınlık sınıflar için hayati öneme sahip! "
-            f"Dışlanmaları durumunda VASC kaybı: {vasc_cost:+.2%}, DF kaybı: {df_cost:+.2%} "
-            f"(En yüksek kayıp: {top_loss_cls} {top_loss_val:+.2%}). "
-            "Bu hastanelerin dışlanması azınlık sınıflarının teşhisini çökertecektir."
-        )
-    elif is_attacker:
-        diagnosis = "HARMFUL_ATTACKER"
-        gained_classes = [CLASS_NAMES[i] for i in range(N_CLASSES) if class_costs[i] < -0.02]
-        gained_str = ", ".join(gained_classes) if gained_classes else "hedef sınıflar"
-        explanation = (
-            f"Seçili merkezlerin ({excluded_str}) dışlanması genel model başarısını artırıyor! "
-            f"Dengeli doğruluk (Bal. Acc) {bal_acc_delta:+.2%} oranında iyileşecek. "
-            f"En çok rahatlayan sınıflar: {gained_str}."
-        )
+    bal_pct = f"{bal_acc_delta:+.1%}"
+    if worst_delta < -0.005:
+        explanation = f"Dışlanırsa dengeli doğruluk {bal_pct}, en büyük kayıp {worst_cls} {worst_delta:+.1%}"
     else:
-        diagnosis = "STANDARD_PEER"
-        explanation = f"{excluded_str} dışlandığında sınıflar arası etki genel varyans sınırları içindedir (Bal. Acc değişimi: {bal_acc_delta:+.2%})."
+        explanation = f"Dışlanırsa dengeli doğruluk {bal_pct}, belirgin bir sınıf kaybı yok"
+
+    if best_delta > 0.01 and best_idx != worst_idx:
+        explanation += f", en yüksek kazanç {best_cls} {best_delta:+.1%}"
+    explanation += "."
 
     return {
         "run_id": run_id,
@@ -266,8 +238,11 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         "full_balanced_acc": full_bal_acc,
         "preview_balanced_acc": prev_bal_acc,
         "bal_acc_delta": bal_acc_delta,
-        "diagnosis": diagnosis,
         "explanation": explanation,
+        "worst_class": worst_cls,
+        "worst_delta": worst_delta,
+        "best_class": best_cls,
+        "best_delta": best_delta,
         "class_names": CLASS_NAMES,
         "low_confidence_classes": ["DF", "SCC", "AK"]
     }

@@ -42,7 +42,9 @@ def test_preview_module(tmp_path, monkeypatch):
     res = preview.preview_exclusion("test_preview_run", 1, 2, "trimmed")
     assert "class_costs" in res
     assert len(res["class_costs"]) == 8
-    assert res["diagnosis"] in ["VALUABLE_MAVERICK", "HARMFUL_ATTACKER", "STANDARD_PEER"]
+    assert "explanation" in res
+    assert "bal_acc_delta" in res
+    assert "worst_class" in res
 
 def test_audit_log(tmp_path, monkeypatch):
     monkeypatch.setattr(audit_log, "AUDIT_FILE", tmp_path / "runs" / "audit_log.json")
