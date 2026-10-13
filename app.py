@@ -393,7 +393,7 @@ with tab3:
     st.info("""
     ℹ️ **Metodolojik Not (RQ3 — Tek Turluk Yeniden Toplama Tahmini):**  
     Bu önizleme, dışlanan merkez(ler) olmadan tüm federasyonu baştan 15 tur **yeniden eğitmek yerine**, mevcut turdaki istemci ağırlıklarını anlık olarak yeniden toplar (*One-Round Counterfactual Re-aggregation*).  
-    Bu hızlı operasyonel tahmin tek turluk ağırlık gradyanlarına dayanır (pilot ölçüm: seed 0, tur 14, FedAvg için $r \\approx 0.45$; 20-seed genelleme analizi hesaplanmaktadır). Önizleme anlık bir operasyonel karar desteğidir; mutlak koalisyon Shapley değeri değildir.
+    Saldırısız FedAvg'de, son turda, 20 seed üzerinden yeniden eğitimle karşılaştırıldığında: tek bir koşuda korelasyon ortalama $r = 0.68$ (0.41–0.87 arası), 20 seed ortalamasında $r = 0.90$. Önizleme etkinin yönünü ve merkez sıralamasını büyük ölçüde doğru verir, ancak büyüklüğünü yaklaşık 1.5 kat küçük tahmin eder ve küçük merkezlerde (3, 4, 5) ayırt edici değildir. Tek bir koşudaki sayılar seed gürültüsü içerir; Trimmed Mean ve Krum için yeniden eğitim referansı yoktur.
     """)
 
     updates_dir = RUNS_DIR / selected_run / "updates"
@@ -436,10 +436,14 @@ with tab3:
             if prev_result:
                 expl = prev_result["explanation"]
                 st.info(f"📊 **Dışlama Etki Özeti:** {expl}")
+                if not prev_result["has_real_features"]:
+                    st.warning("⚠️ **Yaklaşık Tahmin:** `features/` altında test öznitelikleri bulunamadı. Aşağıdaki sayılar "
+                               "model değerlendirmesinden değil, tur telemetrisinden türetilen kaba bir tahmindir.")
 
                 # Waterfall / Bar chart of Class Costs
                 costs = prev_result["class_costs"]
                 deltas = prev_result["delta_recalls"]
+                low_conf = set(prev_result.get("low_confidence_classes", []))
 
                 df_cost = pd.DataFrame({
                     "Sınıf": CLASS_NAMES,
@@ -454,6 +458,7 @@ with tab3:
                     x=df_cost["Sınıf"],
                     y=df_cost["Değişim"] * 100,
                     marker_color=df_cost["Renk"],
+                    marker_pattern_shape=["/" if c in low_conf else "" for c in CLASS_NAMES],
                     text=[f"{v:+.1f}%" for v in (df_cost["Değişim"] * 100)],
                     textposition="auto"
                 ))
@@ -463,6 +468,9 @@ with tab3:
                     height=380
                 )
                 st.plotly_chart(fig_bar, use_container_width=True)
+                if low_conf:
+                    st.caption(f"Taralı çubuklar ({', '.join(c for c in CLASS_NAMES if c in low_conf)}): bu sınıflar model tarafından "
+                               "zayıf öğrenildiği için değişimleri seed gürültüsü içindedir; kesin değer olarak okunmamalıdır.")
 
                 # Ground Truth LOO comparison (RQ3) - ONLY shown for clean FedAvg run
                 ref_coalition_path = Path("reference/coalition_recall_seeds.npy")
@@ -476,7 +484,8 @@ with tab3:
                     and ("atk0" not in selected_run and "atk_0" not in selected_run)
                 )
 
-                if ref_coalition_path.exists() and len(target_ks) == 1 and is_clean_fedavg:
+                is_full_coalition = not cur_meta.get("excluded_clients")   # the reference compares against the full federation
+                if ref_coalition_path.exists() and len(target_ks) == 1 and is_clean_fedavg and is_full_coalition:
                     tgt = target_ks[0]
                     try:
                         V_seeds = np.load(ref_coalition_path)  # (64, 20, 8)
