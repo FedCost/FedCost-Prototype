@@ -1,5 +1,5 @@
 """Multi-seed comparison: 3 aggregation rules x attacked/unattacked x N seeds.
-Answers RQ1 on whatever is in features/ (synthetic now, real features later):
+Answers RQ1 on the features in --features (default features/, the real ones):
 per-class recall as mean +- std over seeds, and the per-class cost of each rule against unattacked FedAvg.
 Usage: python scripts/sweep.py --seeds 20 [--rounds 15] [--attack 0] [--keep-updates]"""
 import argparse
@@ -49,7 +49,9 @@ def main():
     a.add_argument("--attack", type=int, default=0, help="center that flips labels in the attacked condition")
     a.add_argument("--keep-updates", action="store_true")
     a.add_argument("--out", default="results")
+    a.add_argument("--features", default="features", help="feature directory, e.g. features_synthetic")
     args = a.parse_args()
+    contract.FEATURES_DIR = Path(args.features)
 
     conds = [None, args.attack]
     recall = {}                                           # (agg, attack) -> (seeds, classes)

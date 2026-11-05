@@ -2,7 +2,9 @@
 This must work correctly first; the Flower wrapper sits on top of it from day 3.
 Usage: python engine.py --agg trimmed --attack 0 --rounds 30"""
 import argparse
+from pathlib import Path
 import numpy as np
+import contract
 from contract import (N_CLIENTS, N_CLASSES, FEAT_DIM, load_features,
                       save_round, save_update)
 
@@ -113,5 +115,7 @@ if __name__ == "__main__":
     a.add_argument("--rounds", type=int, default=30)
     a.add_argument("--attack", type=int, default=None)
     a.add_argument("--seed", type=int, default=0)
+    a.add_argument("--features", default="features", help="feature directory, e.g. features_synthetic")
     args = a.parse_args()
+    contract.FEATURES_DIR = Path(args.features)
     run(args.agg, args.rounds, args.attack, args.seed)
