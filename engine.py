@@ -154,8 +154,23 @@ AGG = {"fedavg": agg_fedavg, "trimmed": agg_trimmed, "krum": agg_krum}
 def _active_dp(dp_eps):
     return dp_eps is not None and np.isfinite(dp_eps)
 
+
+def subsample_client(X, y, frac=1.0, split_seed=42, client_id=0):
+    """Deterministic local subsampling for Period 1 (e.g. 30%) -> Period 2 (100%) lifecycle runs.
+    Shared helper so the reference track (Sevval) uses the exact same subset per (split_seed, client_id)."""
+    if frac >= 1.0:
+        return X, y
+    if not (0.0 < frac <= 1.0):
+        raise ValueError(f"data_fraction must be in (0, 1], got {frac}")
+    rng = np.random.default_rng([int(split_seed), int(client_id)])
+    n_keep = max(1, int(round(frac * len(y))))
+    idx = np.sort(rng.choice(len(y), size=n_keep, replace=False))
+    return X[idx], y[idx]
+
+
 def run_meta(agg, attack, seed, sizes=None, excluded_clients=(),
-             dp_eps=None, dp_clip=DEFAULT_DP_CLIP, dp_delta=DEFAULT_DP_DELTA):
+             dp_eps=None, dp_clip=DEFAULT_DP_CLIP, dp_delta=DEFAULT_DP_DELTA,
+             shadow_clients=(), data_fraction=1.0, split_seed=42):
     """Round-log meta. 'aggregation'/'attack_client' are the keys the console reads; 'client_sizes' are the
     train set sizes in center order, which the exclusion preview needs to reproduce size-weighted FedAvg."""
     meta = {"agg": agg, "attack": attack, "seed": seed, "aggregation": agg, "attack_client": attack}
@@ -163,6 +178,11 @@ def run_meta(agg, attack, seed, sizes=None, excluded_clients=(),
         meta["client_sizes"] = [int(s) for s in sizes]
     if excluded_clients:
         meta["excluded_clients"] = sorted(int(k) for k in excluded_clients)
+    if shadow_clients:
+        meta["shadow_clients"] = sorted(int(k) for k in shadow_clients)
+    if data_fraction < 1.0:
+        meta["data_fraction"] = float(data_fraction)
+        meta["split_seed"] = int(split_seed)
     if _active_dp(dp_eps):
         meta["dp_eps"] = float(dp_eps)
         meta["dp_clip"] = float(dp_clip)
@@ -170,21 +190,32 @@ def run_meta(agg, attack, seed, sizes=None, excluded_clients=(),
     return meta
 
 def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clients=None,
-        dp_eps=None, dp_clip=DEFAULT_DP_CLIP, dp_delta=DEFAULT_DP_DELTA):
-    """excluded_clients: centers left out of training for the whole run (leave-one-out / custom coalition).
-    They are still part of the pooled test set and appear in the log as excluded, without an update file."""
+        dp_eps=None, dp_clip=DEFAULT_DP_CLIP, dp_delta=DEFAULT_DP_DELTA,
+        shadow_clients=None, data_fraction=1.0, split_seed=42):
+    """excluded_clients: centers left out of training completely (no update file written).
+    shadow_clients: quarantined centers excluded from global aggregation, yet still training locally and
+    writing updates/r{t}_c{k}.npy so the console can run reverse re-admission previews without retraining.
+    data_fraction: fraction of each center's training data used (e.g. 0.30 for Period 1, 1.0 for Period 2)."""
     rng = np.random.default_rng(seed)
+    shadow_rng = np.random.default_rng([int(seed), 99991])    # isolated RNG so active global W is unchanged
     dp_on = _active_dp(dp_eps)
-    if run_id is None:
-        dp_tag = f"_dp{dp_eps:g}" if dp_on else ""
-        run_id = f"{agg}_atk{attack}{dp_tag}_s{seed}"
     left_out = set(excluded_clients or [])
-    active = [k for k in range(N_CLIENTS) if k not in left_out]
+    shadow = set(shadow_clients or [])
+    if left_out & shadow:
+        raise ValueError(f"clients cannot be both excluded and shadow: {sorted(left_out & shadow)}")
+    active = [k for k in range(N_CLIENTS) if k not in left_out and k not in shadow]
     if not active:
         raise ValueError("at least one center must stay in the coalition")
-    data = [load_features(k, "train") for k in range(N_CLIENTS)]
+    if run_id is None:
+        dp_tag = f"_dp{dp_eps:g}" if dp_on else ""
+        frac_tag = f"_f{int(round(data_fraction * 100))}" if data_fraction < 1.0 else ""
+        sh_tag = f"_sh{''.join(str(k) for k in sorted(shadow))}" if shadow else ""
+        run_id = f"{agg}_atk{attack}{dp_tag}{frac_tag}{sh_tag}_s{seed}"
+    raw_data = [load_features(k, "train") for k in range(N_CLIENTS)]
+    data = [subsample_client(X, y, frac=data_fraction, split_seed=split_seed, client_id=k)
+            for k, (X, y) in enumerate(raw_data)]
     test = [load_features(k, "test") for k in range(N_CLIENTS)]
-    if attack in active:                                     # label flipping
+    if attack in active or attack in shadow:                 # label flipping
         X, y = data[attack]
         data[attack] = (X, (N_CLASSES - 1 - y))
     Xg = np.concatenate([t[0] for t in test]); yg = np.concatenate([t[1] for t in test])
@@ -192,9 +223,10 @@ def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clie
     sigmas = {
         k: solve_noise_multiplier(sizes[k], rounds, epochs=2, bs=128, target_eps=float(dp_eps), delta=dp_delta)
         if dp_on else 0.0
-        for k in active
+        for k in range(N_CLIENTS) if k not in left_out
     }
-    meta = run_meta(agg, attack, seed, sizes, left_out, dp_eps=dp_eps, dp_clip=dp_clip, dp_delta=dp_delta)
+    meta = run_meta(agg, attack, seed, sizes, left_out, dp_eps=dp_eps, dp_clip=dp_clip, dp_delta=dp_delta,
+                    shadow_clients=shadow, data_fraction=data_fraction, split_seed=split_seed)
     W = np.zeros((FEAT_DIM + 1, N_CLASSES))
     for t in range(rounds):
         updates, dp_stats = [], {}
@@ -217,6 +249,20 @@ def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clie
                 entry["clipped_frac"] = dp_stats[k]["clipped_frac"]
                 entry["class_clipped_frac"] = dp_stats[k]["class_clipped_frac"]
             clients[k] = entry
+        for k in sorted(shadow):
+            if dp_on:
+                u_sh, st_sh = local_train(W, *data[k], rng=shadow_rng,
+                                          dp_clip=dp_clip, dp_sigma=sigmas[k], return_stats=True)
+            else:
+                u_sh, st_sh = local_train(W, *data[k], rng=shadow_rng), None
+            save_update(run_id, t, k, u_sh)                  # saved for reverse re-admission preview
+            entry = {"class_recall": class_recall(u_sh, *test[k]),
+                     "update_norm": float(np.linalg.norm(u_sh - W)),
+                     "excluded": True, "shadow": True, "reason": "quarantine (shadow)"}
+            if dp_on and st_sh is not None:
+                entry["clipped_frac"] = st_sh["clipped_frac"]
+                entry["class_clipped_frac"] = st_sh["class_clipped_frac"]
+            clients[k] = entry
         for k in left_out:
             clients[k] = {"class_recall": [float("nan")] * N_CLASSES, "update_norm": 0.0,
                           "excluded": True, "reason": "left out of the coalition"}
@@ -236,8 +282,12 @@ if __name__ == "__main__":
     a.add_argument("--dp-eps", type=float, default=None, help="record-level DP-SGD target epsilon (e.g. 8 or 3)")
     a.add_argument("--dp-clip", type=float, default=DEFAULT_DP_CLIP, help="per-sample L2 gradient clipping norm")
     a.add_argument("--dp-delta", type=float, default=DEFAULT_DP_DELTA, help="DP delta (default 1e-5)")
+    a.add_argument("--shadow", type=int, nargs="*", default=None, help="quarantined center IDs in shadow mode")
+    a.add_argument("--data-fraction", type=float, default=1.0, help="training data fraction in (0, 1], e.g. 0.3")
+    a.add_argument("--split-seed", type=int, default=42, help="seed for deterministic data_fraction subsampling")
     a.add_argument("--features", default="features", help="feature directory, e.g. features_synthetic")
     args = a.parse_args()
     contract.FEATURES_DIR = Path(args.features)
     run(args.agg, args.rounds, args.attack, args.seed,
-        dp_eps=args.dp_eps, dp_clip=args.dp_clip, dp_delta=args.dp_delta)
+        dp_eps=args.dp_eps, dp_clip=args.dp_clip, dp_delta=args.dp_delta,
+        shadow_clients=args.shadow, data_fraction=args.data_fraction, split_seed=args.split_seed)
