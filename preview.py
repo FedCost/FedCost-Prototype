@@ -172,34 +172,41 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
         X_eval = np.concatenate(all_X, axis=0)
         y_eval = np.concatenate(all_y, axis=0)
         full_recalls, full_bal_acc = evaluate_linear_model(W_full, X_eval, y_eval)
-        prev_recalls, prev_bal_acc = evaluate_linear_model(W_preview, X_eval, y_eval)
+        if len(included_updates) == 0:
+            # Tüm merkezler dışlandığında model yok; doğrudan %0 başarım
+            prev_recalls = np.zeros(N_CLASSES, dtype=float)
+            prev_bal_acc = 0.0
+        else:
+            prev_recalls, prev_bal_acc = evaluate_linear_model(W_preview, X_eval, y_eval)
     else:
         # Fallback: estimate impact analytically from saved round telemetry
         if round_json_data is not None:
             data = round_json_data
             full_recalls = np.array(data.get("global_class_recall", [0.5]*N_CLASSES))
-            
-            # Aggregate client penalties for all excluded clients
-            total_penalty = np.zeros(N_CLASSES, dtype=float)
-            for ex_k in excluded_list:
-                client_data = data.get("clients", {}).get(str(ex_k), {})
-                c_recalls = np.array(client_data.get("class_recall", full_recalls))
-                # Client carrying higher recall than global loses signal when dropped
-                total_penalty += np.maximum(0, (c_recalls - full_recalls)) * 0.35
-            
-            # Additional penalty if a large fraction of the federation is excluded
-            if len(excluded_list) > 1:
-                frac_excluded = len(excluded_list) / N_CLIENTS
-                total_penalty += frac_excluded * 0.15
-
-            prev_recalls = np.clip(full_recalls - total_penalty, 0.01, 1.0)
             full_bal_acc = float(np.mean(full_recalls))
-            prev_bal_acc = float(np.mean(prev_recalls))
+            
+            if len(included_updates) == 0:
+                prev_recalls = np.zeros(N_CLASSES, dtype=float)
+                prev_bal_acc = 0.0
+            else:
+                # Aggregate client penalties for all excluded clients
+                total_penalty = np.zeros(N_CLASSES, dtype=float)
+                for ex_k in excluded_list:
+                    client_data = data.get("clients", {}).get(str(ex_k), {})
+                    c_recalls = np.array(client_data.get("class_recall", full_recalls))
+                    total_penalty += np.maximum(0, (c_recalls - full_recalls)) * 0.35
+                
+                if len(excluded_list) > 1:
+                    frac_excluded = len(excluded_list) / N_CLIENTS
+                    total_penalty += frac_excluded * 0.15
+
+                prev_recalls = np.clip(full_recalls - total_penalty, 0.01, 1.0)
+                prev_bal_acc = float(np.mean(prev_recalls))
         else:
             full_recalls = np.full(N_CLASSES, 0.5)
-            prev_recalls = np.full(N_CLASSES, 0.5)
+            prev_recalls = np.zeros(N_CLASSES) if len(included_updates) == 0 else np.full(N_CLASSES, 0.5)
             full_bal_acc = 0.5
-            prev_bal_acc = 0.5
+            prev_bal_acc = 0.0 if len(included_updates) == 0 else 0.5
 
     delta_recalls = prev_recalls - full_recalls
     class_costs = -delta_recalls  # Positive cost = performance dropped when excluded
@@ -215,12 +222,14 @@ def preview_exclusion(run_id, round_t, excluded_clients, rule="fedavg", client_s
     best_cls = CLASS_NAMES[best_idx]
 
     bal_pct = f"{bal_acc_delta:+.1%}"
-    if worst_delta < -0.005:
+    if len(included_updates) == 0:
+        explanation = f"Tüm merkezler dışlandığı için model oluşmadı; dengeli doğruluk {bal_pct}, tüm sınıfların başarımı %0'a düştü."
+    elif worst_delta < -0.005:
         explanation = f"Dışlanırsa dengeli doğruluk {bal_pct}, en büyük kayıp {worst_cls} {worst_delta:+.1%}"
     else:
         explanation = f"Dışlanırsa dengeli doğruluk {bal_pct}, belirgin bir sınıf kaybı yok"
 
-    if best_delta > 0.01 and best_idx != worst_idx:
+    if len(included_updates) > 0 and best_delta > 0.01 and best_idx != worst_idx:
         explanation += f", en yüksek kazanç {best_cls} {best_delta:+.1%}"
     explanation += "."
 
