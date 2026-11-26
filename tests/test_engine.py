@@ -209,3 +209,35 @@ def test_dp_inf_matches_none_exact(mini_features):
     assert np.array_equal(W_none, W_inf)
     rec = json.loads((mini_features / "runs" / "dp_inf" / "round_1.json").read_text())
     assert "dp_eps" not in rec["meta"]
+
+
+def test_shadow_clients_write_updates_without_affecting_global_model(mini_features):
+    W_ex = engine.run("fedavg", rounds=2, seed=5, run_id="ex", excluded_clients=[2])
+    W_sh = engine.run("fedavg", rounds=2, seed=5, run_id="sh", shadow_clients=[2])
+    assert np.array_equal(W_ex, W_sh)
+    rd = mini_features / "runs" / "sh"
+    rec = json.loads((rd / "round_1.json").read_text())
+    assert rec["meta"]["shadow_clients"] == [2]
+    assert rec["clients"]["2"]["excluded"] is True
+    assert rec["clients"]["2"]["shadow"] is True
+    assert rec["clients"]["2"]["reason"] == "quarantine (shadow)"
+    assert rec["clients"]["2"]["update_norm"] > 0.0
+    # All 6 update files exist (including shadow client 2) for reverse re-admission preview
+    assert sorted(p.name for p in (rd / "updates").iterdir() if p.name.startswith("r1_")) == [
+        f"r1_c{k}.npy" for k in range(N_CLIENTS)
+    ]
+
+
+def test_data_fraction_subsampling_is_deterministic_and_recorded(mini_features):
+    W1 = engine.run("fedavg", rounds=2, seed=3, run_id="p1a", data_fraction=0.3, split_seed=42)
+    W2 = engine.run("fedavg", rounds=2, seed=3, run_id="p1b", data_fraction=0.3, split_seed=42)
+    assert np.array_equal(W1, W2)
+    rec = json.loads((mini_features / "runs" / "p1a" / "round_1.json").read_text())
+    assert rec["meta"]["data_fraction"] == 0.3
+    assert rec["meta"]["split_seed"] == 42
+    assert rec["meta"]["client_sizes"] == [24] * N_CLIENTS    # 30% of 80 = 24
+
+
+def test_shadow_and_excluded_overlap_raises(mini_features):
+    with pytest.raises(ValueError):
+        engine.run("fedavg", rounds=1, run_id="bad", excluded_clients=[1], shadow_clients=[1])
