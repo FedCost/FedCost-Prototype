@@ -20,3 +20,17 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+
+# Pitch deck and presentation generation scripts
+scripts/pdf_builder.py
+scripts/generate_pitch_deck.py
+docs/FedCost_Pitch_Deck.pdf
+*.pdf
+
+# Google Drive research link, local literature notes & agent memory
+drive-research
+drive-research/
+literature_notes/
+reports/
+AGENTS.md
+.claude/SESSION_HISTORY.md

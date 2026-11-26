@@ -10,15 +10,17 @@ from flwr.serverapp.strategy import FedAvg
 from flwr.supercore import log
 
 from contract import N_CLASSES, N_CLIENTS, save_round, save_update
-from engine import AGG, run_meta
+from engine import AGG, DEFAULT_DP_CLIP, DEFAULT_DP_DELTA, run_meta
 
 
 class FedCostStrategy(FedAvg):
-    def __init__(self, agg: str, run_id: str, attack: int | None, seed: int, n_clients: int = N_CLIENTS):
+    def __init__(self, agg: str, run_id: str, attack: int | None, seed: int, n_clients: int = N_CLIENTS,
+                 dp_eps: float | None = None, dp_clip: float = DEFAULT_DP_CLIP, dp_delta: float = DEFAULT_DP_DELTA):
         super().__init__(fraction_train=1.0, fraction_evaluate=1.0,
                          min_train_nodes=n_clients, min_evaluate_nodes=n_clients,
                          min_available_nodes=n_clients)
         self.agg, self.run_id, self.attack, self.seed = agg, run_id, attack, seed
+        self.dp_eps, self.dp_clip, self.dp_delta = dp_eps, dp_clip, dp_delta
         self._W = None                 # global model at the start of the round (for update_norm)
         self._pending = None           # (t, client telemetry, meta): completed in the evaluation round
         self.last_global_recall = None
@@ -48,10 +50,15 @@ class FedCostStrategy(FedAvg):
 
         clients = {}
         for i, (cid, m) in enumerate(zip(cids, ok)):
-            clients[cid] = {"class_recall": list(m.content["metrics"]["class-recall"]),
-                            "update_norm": float(np.linalg.norm(ups[i] - self._W)),
-                            "excluded": info[i][0], "reason": info[i][1]}
-        self._pending = (t, clients, run_meta(self.agg, self.attack, self.seed, sizes))
+            entry = {"class_recall": list(m.content["metrics"]["class-recall"]),
+                     "update_norm": float(np.linalg.norm(ups[i] - self._W)),
+                     "excluded": info[i][0], "reason": info[i][1]}
+            if "clipped-frac" in m.content["metrics"]:
+                entry["clipped_frac"] = float(m.content["metrics"]["clipped-frac"])
+                entry["class_clipped_frac"] = list(m.content["metrics"]["class-clipped-frac"])
+            clients[cid] = entry
+        self._pending = (t, clients, run_meta(self.agg, self.attack, self.seed, sizes,
+                                              dp_eps=self.dp_eps, dp_clip=self.dp_clip, dp_delta=self.dp_delta))
         n_ex = sum(c["excluded"] for c in clients.values())
         log(INFO, "Round %d: aggregated with %s, number of excluded clients: %d", t, self.agg, n_ex)
         return ArrayRecord.from_numpy_ndarrays([new_W]), MetricRecord({"num-excluded": n_ex})
