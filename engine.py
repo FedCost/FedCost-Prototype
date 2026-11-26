@@ -1,32 +1,120 @@
 """Core of the federation engine: pure numpy, no Flower.
 This must work correctly first; the Flower wrapper sits on top of it from day 3.
-Usage: python engine.py --agg trimmed --attack 0 --rounds 30"""
+Usage: python engine.py --agg trimmed --attack 0 --rounds 30 [--dp-eps 8]"""
 import argparse
+from functools import lru_cache
 from pathlib import Path
 import numpy as np
+from scipy.optimize import brentq
+from scipy.special import gammaln, logsumexp
 import contract
 from contract import (N_CLIENTS, N_CLASSES, FEAT_DIM, load_features,
                       save_round, save_update)
+
+# ---------- Differential Privacy (record-level DP-SGD, Mironov 2019 RDP) ----------
+_RDP_ALPHAS = np.arange(2, 129, dtype=float)
+DEFAULT_DP_CLIP = 10.0     # ~median per-sample grad norm on Fed-ISIC2019 EfficientNet-B0 features
+DEFAULT_DP_DELTA = 1e-5    # satisfies delta < 1/N_k for all 6 Fed-ISIC2019 centers (N_k in [351, 9930])
+
+
+def rdp_subsampled_gaussian(q, sigma, alpha):
+    """Exact Renyi DP of one subsampled Gaussian step at integer order alpha >= 2 (Mironov 2019)."""
+    if q >= 1.0:
+        return float(alpha / (2.0 * sigma * sigma))
+    k = np.arange(0, int(alpha) + 1, dtype=float)
+    log_binom = gammaln(alpha + 1.0) - gammaln(k + 1.0) - gammaln(alpha - k + 1.0)
+    log_terms = (log_binom
+                 + (alpha - k) * np.log(1.0 - q)
+                 + k * np.log(q)
+                 + k * (k - 1.0) / (2.0 * sigma * sigma))
+    return float(logsumexp(log_terms) / (alpha - 1.0))
+
+
+def eps_from_sigma(q, sigma, steps, delta=DEFAULT_DP_DELTA):
+    """Converts T steps of subsampled Gaussian RDP to (epsilon, delta)-DP (Balle et al. 2020)."""
+    rdps = np.array([steps * rdp_subsampled_gaussian(q, sigma, a) for a in _RDP_ALPHAS])
+    eps = rdps + np.log((_RDP_ALPHAS - 1.0) / _RDP_ALPHAS) - (np.log(delta) + np.log(_RDP_ALPHAS)) / (_RDP_ALPHAS - 1.0)
+    return float(np.min(eps))
+
+
+@lru_cache(maxsize=256)
+def solve_noise_multiplier(n_samples, rounds, epochs, bs, target_eps, delta=DEFAULT_DP_DELTA):
+    """Solves for per-step Gaussian noise multiplier sigma achieving (target_eps, delta)-DP."""
+    if target_eps is None or not np.isfinite(target_eps):
+        return 0.0
+    if target_eps <= 0:
+        raise ValueError(f"dp_eps must be positive, got {target_eps}")
+    q = min(1.0, bs / max(int(n_samples), 1))
+    steps = max(1, int(rounds) * int(epochs) * int(np.ceil(n_samples / bs)))
+    lo, hi = 0.05, 100.0
+    while eps_from_sigma(q, hi, steps, delta) > target_eps:
+        hi *= 2.0
+    return float(brentq(lambda s: eps_from_sigma(q, s, steps, delta) - target_eps, lo, hi, xtol=1e-4))
+
 
 # ---------- Model: linear softmax head ----------
 def predict(W, X):
     return (X @ W[:-1] + W[-1]).argmax(1)
 
 # Defaults match reference/coalition_meta.json (Shapley coalitions); change both together.
-def local_train(W, X, y, epochs=2, lr=0.05, bs=128, l2=1e-4, rng=None):
+def local_train(W, X, y, epochs=2, lr=0.05, bs=128, l2=1e-4, rng=None,
+                dp_clip=None, dp_sigma=0.0, return_stats=False):
     W = W.copy()
     Y = np.eye(N_CLASSES)[y]
+    if dp_clip is None:
+        for _ in range(epochs):
+            idx = rng.permutation(len(X))
+            for i in range(0, len(X), bs):
+                b = idx[i:i + bs]
+                z = X[b] @ W[:-1] + W[-1]
+                z -= z.max(1, keepdims=True)
+                P = np.exp(z); P /= P.sum(1, keepdims=True)
+                G = (P - Y[b]) / len(b)
+                W[:-1] -= lr * (X[b].T @ G + l2 * W[:-1])   # L2 on weights only, not the bias
+                W[-1] -= lr * G.sum(0)
+        return (W, None) if return_stats else W
+
+    # Record-level DP-SGD: exact per-sample L2 gradient clipping via rank-1 identity
+    # ||[x_i e_i^T; e_i^T]||_F = sqrt((||x_i||_2^2 + 1) * ||e_i||_2^2)
+    x_sq = np.sum(X * X, axis=1)
+    clipped_by_cls = np.zeros(N_CLASSES, dtype=np.int64)
+    total_by_cls = np.zeros(N_CLASSES, dtype=np.int64)
     for _ in range(epochs):
         idx = rng.permutation(len(X))
         for i in range(0, len(X), bs):
             b = idx[i:i + bs]
-            z = X[b] @ W[:-1] + W[-1]
+            Xb = X[b]
+            yb = y[b]
+            z = Xb @ W[:-1] + W[-1]
             z -= z.max(1, keepdims=True)
             P = np.exp(z); P /= P.sum(1, keepdims=True)
-            G = (P - Y[b]) / len(b)
-            W[:-1] -= lr * (X[b].T @ G + l2 * W[:-1])   # L2 on weights only, not the bias
-            W[-1] -= lr * G.sum(0)
-    return W
+            E = P - Y[b]
+            norms = np.sqrt((x_sq[b] + 1.0) * np.sum(E * E, axis=1))
+            clipped_mask = norms > dp_clip
+            scale = np.minimum(1.0, dp_clip / np.maximum(norms, 1e-12))
+            total_by_cls += np.bincount(yb, minlength=N_CLASSES)
+            if np.any(clipped_mask):
+                clipped_by_cls += np.bincount(yb[clipped_mask], minlength=N_CLASSES)
+            Ec = E * scale[:, None]
+            gW = (Xb.T @ Ec) / len(b)
+            gb = Ec.sum(0) / len(b)
+            if dp_sigma > 0.0:
+                std = dp_sigma * dp_clip / len(b)
+                gW = gW + rng.normal(0.0, std, size=gW.shape)
+                gb = gb + rng.normal(0.0, std, size=gb.shape)
+            W[:-1] -= lr * (gW + l2 * W[:-1])
+            W[-1] -= lr * gb
+    if not return_stats:
+        return W
+    total_all = int(total_by_cls.sum())
+    stats = {
+        "clipped_frac": float(clipped_by_cls.sum() / total_all) if total_all > 0 else 0.0,
+        "class_clipped_frac": [
+            float(clipped_by_cls[c] / total_by_cls[c]) if total_by_cls[c] > 0 else float("nan")
+            for c in range(N_CLASSES)
+        ],
+    }
+    return W, stats
 
 def class_recall(W, X, y):
     yp = predict(W, X)
@@ -63,7 +151,11 @@ def agg_krum(updates, sizes, f=1):
 AGG = {"fedavg": agg_fedavg, "trimmed": agg_trimmed, "krum": agg_krum}
 
 # ---------- Run ----------
-def run_meta(agg, attack, seed, sizes=None, excluded_clients=()):
+def _active_dp(dp_eps):
+    return dp_eps is not None and np.isfinite(dp_eps)
+
+def run_meta(agg, attack, seed, sizes=None, excluded_clients=(),
+             dp_eps=None, dp_clip=DEFAULT_DP_CLIP, dp_delta=DEFAULT_DP_DELTA):
     """Round-log meta. 'aggregation'/'attack_client' are the keys the console reads; 'client_sizes' are the
     train set sizes in center order, which the exclusion preview needs to reproduce size-weighted FedAvg."""
     meta = {"agg": agg, "attack": attack, "seed": seed, "aggregation": agg, "attack_client": attack}
@@ -71,13 +163,21 @@ def run_meta(agg, attack, seed, sizes=None, excluded_clients=()):
         meta["client_sizes"] = [int(s) for s in sizes]
     if excluded_clients:
         meta["excluded_clients"] = sorted(int(k) for k in excluded_clients)
+    if _active_dp(dp_eps):
+        meta["dp_eps"] = float(dp_eps)
+        meta["dp_clip"] = float(dp_clip)
+        meta["dp_delta"] = float(dp_delta)
     return meta
 
-def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clients=None):
+def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clients=None,
+        dp_eps=None, dp_clip=DEFAULT_DP_CLIP, dp_delta=DEFAULT_DP_DELTA):
     """excluded_clients: centers left out of training for the whole run (leave-one-out / custom coalition).
     They are still part of the pooled test set and appear in the log as excluded, without an update file."""
     rng = np.random.default_rng(seed)
-    run_id = run_id or f"{agg}_atk{attack}_s{seed}"
+    dp_on = _active_dp(dp_eps)
+    if run_id is None:
+        dp_tag = f"_dp{dp_eps:g}" if dp_on else ""
+        run_id = f"{agg}_atk{attack}{dp_tag}_s{seed}"
     left_out = set(excluded_clients or [])
     active = [k for k in range(N_CLIENTS) if k not in left_out]
     if not active:
@@ -89,16 +189,34 @@ def run(agg="fedavg", rounds=30, attack=None, seed=0, run_id=None, excluded_clie
         data[attack] = (X, (N_CLASSES - 1 - y))
     Xg = np.concatenate([t[0] for t in test]); yg = np.concatenate([t[1] for t in test])
     sizes = [len(d[1]) for d in data]
-    meta = run_meta(agg, attack, seed, sizes, left_out)
+    sigmas = {
+        k: solve_noise_multiplier(sizes[k], rounds, epochs=2, bs=128, target_eps=float(dp_eps), delta=dp_delta)
+        if dp_on else 0.0
+        for k in active
+    }
+    meta = run_meta(agg, attack, seed, sizes, left_out, dp_eps=dp_eps, dp_clip=dp_clip, dp_delta=dp_delta)
     W = np.zeros((FEAT_DIM + 1, N_CLASSES))
     for t in range(rounds):
-        updates = [local_train(W, *data[k], rng=rng) for k in active]
+        updates, dp_stats = [], {}
+        for k in active:
+            if dp_on:
+                u, st = local_train(W, *data[k], rng=rng, dp_clip=dp_clip, dp_sigma=sigmas[k], return_stats=True)
+                dp_stats[k] = st
+            else:
+                u = local_train(W, *data[k], rng=rng)
+            updates.append(u)
         for k, u in zip(active, updates):
             save_update(run_id, t, k, u)
         new_W, info = AGG[agg](updates, [sizes[k] for k in active])   # info indices follow list order
-        clients = {k: {"class_recall": class_recall(u, *test[k]),    # telemetry: on its own validation data
-                       "update_norm": float(np.linalg.norm(u - W)),
-                       "excluded": info[i][0], "reason": info[i][1]} for i, (k, u) in enumerate(zip(active, updates))}
+        clients = {}
+        for i, (k, u) in enumerate(zip(active, updates)):
+            entry = {"class_recall": class_recall(u, *test[k]),       # telemetry: on its own validation data
+                     "update_norm": float(np.linalg.norm(u - W)),
+                     "excluded": info[i][0], "reason": info[i][1]}
+            if dp_on:
+                entry["clipped_frac"] = dp_stats[k]["clipped_frac"]
+                entry["class_clipped_frac"] = dp_stats[k]["class_clipped_frac"]
+            clients[k] = entry
         for k in left_out:
             clients[k] = {"class_recall": [float("nan")] * N_CLASSES, "update_norm": 0.0,
                           "excluded": True, "reason": "left out of the coalition"}
@@ -115,7 +233,11 @@ if __name__ == "__main__":
     a.add_argument("--rounds", type=int, default=30)
     a.add_argument("--attack", type=int, default=None)
     a.add_argument("--seed", type=int, default=0)
+    a.add_argument("--dp-eps", type=float, default=None, help="record-level DP-SGD target epsilon (e.g. 8 or 3)")
+    a.add_argument("--dp-clip", type=float, default=DEFAULT_DP_CLIP, help="per-sample L2 gradient clipping norm")
+    a.add_argument("--dp-delta", type=float, default=DEFAULT_DP_DELTA, help="DP delta (default 1e-5)")
     a.add_argument("--features", default="features", help="feature directory, e.g. features_synthetic")
     args = a.parse_args()
     contract.FEATURES_DIR = Path(args.features)
-    run(args.agg, args.rounds, args.attack, args.seed)
+    run(args.agg, args.rounds, args.attack, args.seed,
+        dp_eps=args.dp_eps, dp_clip=args.dp_clip, dp_delta=args.dp_delta)

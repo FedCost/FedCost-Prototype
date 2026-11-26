@@ -134,3 +134,78 @@ def test_synthetic_never_writes_real_features(tmp_path, monkeypatch):
     assert not (tmp_path / "features").exists() and contract.FEATURES_DIR == Path("features")
     with pytest.raises(ValueError):
         synthetic.make(out_dir="features")
+
+
+def test_dp_vectorized_clipping_matches_naive_per_sample_loop():
+    rng = np.random.default_rng(42)
+    X = rng.normal(0, 2.0, (16, 20)).astype(np.float32)
+    y = rng.integers(0, N_CLASSES, 16)
+    W0 = rng.normal(0, 0.2, (21, N_CLASSES))
+    clip, lr, l2 = 3.0, 0.05, 1e-4
+
+    # Naive per-sample loop (single batch, zero noise)
+    W_ref = W0.copy()
+    Y = np.eye(N_CLASSES)[y]
+    z = X @ W_ref[:-1] + W_ref[-1]
+    z -= z.max(1, keepdims=True)
+    P = np.exp(z); P /= P.sum(1, keepdims=True)
+    E = P - Y
+    gW_sum = np.zeros_like(W_ref[:-1])
+    gb_sum = np.zeros_like(W_ref[-1])
+    clipped_cnt = 0
+    for i in range(len(X)):
+        gW_i = np.outer(X[i], E[i])
+        gb_i = E[i]
+        norm_i = np.sqrt(np.sum(gW_i ** 2) + np.sum(gb_i ** 2))
+        if norm_i > clip:
+            clipped_cnt += 1
+            s = clip / norm_i
+            gW_i *= s
+            gb_i = gb_i * s
+        gW_sum += gW_i
+        gb_sum += gb_i
+    W_ref[:-1] -= lr * (gW_sum / len(X) + l2 * W_ref[:-1])
+    W_ref[-1] -= lr * (gb_sum / len(X))
+
+    # Vectorized engine.local_train (bs=16, epochs=1, dp_sigma=0)
+    W_vec, stats = engine.local_train(
+        W0, X, y, epochs=1, lr=lr, bs=16, l2=l2,
+        rng=np.random.default_rng(0), dp_clip=clip, dp_sigma=0.0, return_stats=True,
+    )
+    assert np.allclose(W_vec, W_ref, atol=1e-12)
+    assert np.isclose(stats["clipped_frac"], clipped_cnt / len(X))
+
+
+def test_dp_accountant_monotonic_and_accurate():
+    s_eps8 = engine.solve_noise_multiplier(3000, rounds=15, epochs=2, bs=128, target_eps=8.0)
+    s_eps3 = engine.solve_noise_multiplier(3000, rounds=15, epochs=2, bs=128, target_eps=3.0)
+    assert s_eps3 > s_eps8 > 0.0
+    q = 128 / 3000
+    steps = 15 * 2 * int(np.ceil(3000 / 128))
+    assert np.isclose(engine.eps_from_sigma(q, s_eps8, steps), 8.0, atol=1e-2)
+    assert np.isclose(engine.eps_from_sigma(q, s_eps3, steps), 3.0, atol=1e-2)
+    assert engine.solve_noise_multiplier(3000, 15, 2, 128, None) == 0.0
+    assert engine.solve_noise_multiplier(3000, 15, 2, 128, float("inf")) == 0.0
+
+
+def test_dp_run_reproducible_and_logs_telemetry(mini_features):
+    W1 = engine.run("fedavg", rounds=2, seed=11, run_id="dp_a", dp_eps=8.0, dp_clip=5.0)
+    W2 = engine.run("fedavg", rounds=2, seed=11, run_id="dp_b", dp_eps=8.0, dp_clip=5.0)
+    W_clean = engine.run("fedavg", rounds=2, seed=11, run_id="clean", dp_eps=None)
+    assert np.array_equal(W1, W2)
+    assert not np.array_equal(W1, W_clean)
+    rec = json.loads((mini_features / "runs" / "dp_a" / "round_1.json").read_text())
+    assert rec["meta"]["dp_eps"] == 8.0
+    assert rec["meta"]["dp_clip"] == 5.0
+    assert rec["meta"]["dp_delta"] == engine.DEFAULT_DP_DELTA
+    for c in rec["clients"].values():
+        assert 0.0 <= c["clipped_frac"] <= 1.0
+        assert len(c["class_clipped_frac"]) == N_CLASSES
+
+
+def test_dp_inf_matches_none_exact(mini_features):
+    W_none = engine.run("trimmed", rounds=2, seed=4, run_id="dp_none", dp_eps=None)
+    W_inf = engine.run("trimmed", rounds=2, seed=4, run_id="dp_inf", dp_eps=float("inf"))
+    assert np.array_equal(W_none, W_inf)
+    rec = json.loads((mini_features / "runs" / "dp_inf" / "round_1.json").read_text())
+    assert "dp_eps" not in rec["meta"]
