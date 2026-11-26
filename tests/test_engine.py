@@ -123,3 +123,14 @@ def test_run_leaves_excluded_clients_out(mini_features):
     assert [rec["clients"][str(k)]["excluded"] for k in range(N_CLIENTS)] == [k in (2, 4) for k in range(N_CLIENTS)]
     with pytest.raises(ValueError):
         engine.run("fedavg", rounds=1, run_id="empty", excluded_clients=range(N_CLIENTS))
+
+
+def test_synthetic_never_writes_real_features(tmp_path, monkeypatch):
+    import synthetic
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(synthetic, "SIZES", [10] * N_CLIENTS)
+    synthetic.make(out_dir="syn")
+    assert len(list((tmp_path / "syn").glob("*.npz"))) == 2 * N_CLIENTS
+    assert not (tmp_path / "features").exists() and contract.FEATURES_DIR == Path("features")
+    with pytest.raises(ValueError):
+        synthetic.make(out_dir="features")

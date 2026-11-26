@@ -32,8 +32,8 @@ Do NOT do the other tracks' work. Only produce the outputs they will read, in co
 ## Commands
 ```
 pip install -r requirements.txt
-python synthetic.py                       # synthetic features -> features/
-python engine.py --agg trimmed --rounds 15 [--attack 0] [--seed 1]
+python synthetic.py                       # synthetic features -> features_synthetic/ (never features/)
+python engine.py --agg trimmed --rounds 15 [--attack 0] [--seed 1] [--features features_synthetic]
 pytest -q
 ```
 In the synthetic data, center 2 is rich in rare classes (DF, VASC) and center 4 has a device shift.
